@@ -230,8 +230,21 @@ async def check_job_status(
         # Convert result to string if it's a dict/JSON object
         result = job.get("result")
         if result and isinstance(result, dict):
-            import json
-            result = json.dumps(result)
+            # Check if this is a kodosumi result with final_result structure
+            if "final_result" in result and isinstance(result["final_result"], dict):
+                # Extract the body content from nested structure
+                final_result = result["final_result"]
+                if "Markdown" in final_result and isinstance(final_result["Markdown"], dict):
+                    # Return just the body content
+                    result = final_result["Markdown"].get("body", "")
+                else:
+                    # If not in expected format, return the whole final_result as JSON
+                    import json
+                    result = json.dumps(final_result)
+            else:
+                # For other dict results, convert to JSON string
+                import json
+                result = json.dumps(result)
         
         response = StatusResponse(
             job_id=job_id,
