@@ -227,11 +227,17 @@ async def check_job_status(
             raise HTTPException(status_code=404, detail="Job not found for this flow")
         
         # Build status response
+        # Convert result to string if it's a dict/JSON object
+        result = job.get("result")
+        if result and isinstance(result, dict):
+            import json
+            result = json.dumps(result)
+        
         response = StatusResponse(
             job_id=job_id,
             status=job["status"],
             message=job.get("message"),
-            result=job.get("result"),
+            result=result,
             reasoning=job.get("reasoning")
         )
         
