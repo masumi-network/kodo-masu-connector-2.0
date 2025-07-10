@@ -14,9 +14,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the authenticator script
 COPY authenticator/authenticator.py .
 
-# Copy the test script
-COPY scripts/test_authentication.py .
-
 # Make the script executable
 RUN chmod +x authenticator.py
 

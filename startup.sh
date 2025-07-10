@@ -33,20 +33,7 @@ docker compose ps
 echo "Waiting for database and services to be fully ready..."
 sleep 20
 
-# Run the test scripts only if services are running
-echo "Running authentication test script..."
-if docker compose ps authenticator | grep -q "Up"; then
-    docker compose exec -T authenticator python /app/test_authentication.py
-else
-    echo "Authenticator service is not running - skipping test"
-fi
-
-echo "Running flow sync test script..."
-if docker compose ps flow-sync | grep -q "Up"; then
-    docker compose exec -T flow-sync python /app/test_flow_sync.py
-else
-    echo "Flow sync service is not running - skipping test"
-fi
+# Services are now ready
 
 echo "Startup complete!"
 echo ""

@@ -15,9 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY flow-sync/flow_sync.py .
 COPY flow-sync/mip003_converter.py .
 
-# Copy the test script
-COPY scripts/test_flow_sync.py .
-
 # Make the script executable
 RUN chmod +x flow_sync.py
 
