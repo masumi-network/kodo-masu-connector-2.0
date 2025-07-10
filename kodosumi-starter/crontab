@@ -1,0 +1,3 @@
+# Run Kodosumi job starter every minute
+# Load environment variables and run the script
+* * * * * . /etc/environment && cd /app && /usr/local/bin/python /app/run_starter.py >> /var/log/cron.log 2>&1

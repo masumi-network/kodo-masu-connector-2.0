@@ -1,0 +1,181 @@
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: kodosumi-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  authenticator:
+    build:
+      context: .
+      dockerfile: ./authenticator/Dockerfile
+    container_name: kodosumi-authenticator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KODOSUMI_SERVER_URL: ${KODOSUMI_SERVER_URL}
+      KODOSUMI_USERNAME: ${KODOSUMI_USERNAME}
+      KODOSUMI_PASSWORD: ${KODOSUMI_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: kodosumi-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
+      PGADMIN_CONFIG_LOGIN_BANNER: "\"Kodosumi Database Administration\""
+    ports:
+      - "8080:80"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  flow-sync:
+    build:
+      context: .
+      dockerfile: ./flow-sync/Dockerfile
+    container_name: kodosumi-flow-sync
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KODOSUMI_SERVER_URL: ${KODOSUMI_SERVER_URL}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  admin-dashboard:
+    build:
+      context: .
+      dockerfile: ./admin-dashboard/Dockerfile
+    container_name: kodosumi-admin-dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  api-server:
+    build:
+      context: .
+      dockerfile: ./api-server/Dockerfile
+    container_name: kodosumi-api-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PAYMENT_SERVICE_URL: ${PAYMENT_SERVICE_URL}
+      PAYMENT_API_KEY: ${PAYMENT_API_KEY}
+      AGENT_IDENTIFIER: ${AGENT_IDENTIFIER}
+      NETWORK: ${NETWORK}
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  payment-checker:
+    build:
+      context: .
+      dockerfile: ./payment-checker/Dockerfile
+    container_name: kodosumi-payment-checker
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PAYMENT_SERVICE_URL: ${PAYMENT_SERVICE_URL}
+      PAYMENT_API_KEY: ${PAYMENT_API_KEY}
+      NETWORK: ${NETWORK}
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  kodosumi-starter:
+    build:
+      context: .
+      dockerfile: ./kodosumi-starter/Dockerfile
+    container_name: kodosumi-starter
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      KODOSUMI_SERVER_URL: ${KODOSUMI_SERVER_URL}
+      KODOSUMI_USERNAME: ${KODOSUMI_USERNAME}
+      KODOSUMI_PASSWORD: ${KODOSUMI_PASSWORD}
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  kodosumi-status:
+    build:
+      context: .
+      dockerfile: kodosumi-status/Dockerfile
+    container_name: kodosumi-status
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      KODOSUMI_SERVER_URL: ${KODOSUMI_SERVER_URL}
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

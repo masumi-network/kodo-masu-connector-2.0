@@ -1,0 +1,2 @@
+# Run the Kodosumi status checker every 2 minutes
+*/2 * * * * . /etc/environment && cd /app && /usr/local/bin/python /app/run_status_checker.py >> /var/log/cron.log 2>&1

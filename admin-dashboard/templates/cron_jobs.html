@@ -1,0 +1,220 @@
+{% extends "base.html" %}
+
+{% block title %}Cron Jobs - Kodosumi Admin{% endblock %}
+
+{% block header %}Cron Jobs Status{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title">Scheduled Jobs</h5>
+                <small class="text-muted">Monitor the status of all scheduled background jobs</small>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-striped">
+                        <thead>
+                            <tr>
+                                <th>Job Name</th>
+                                <th>Service</th>
+                                <th>Schedule</th>
+                                <th>Status</th>
+                                <th>Last Run</th>
+                                <th>Next Run</th>
+                                <th>Total Executions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cron-jobs-table">
+                            <tr>
+                                <td colspan="7" class="text-center">Loading...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mt-4">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="card-title">Job Details</h6>
+            </div>
+            <div class="card-body">
+                <h6>API Key Sync</h6>
+                <p class="text-muted">Authenticates with the Kodosumi server and refreshes the API key used for all other services.</p>
+                <ul class="list-unstyled">
+                    <li><strong>Frequency:</strong> Every 10 hours</li>
+                    <li><strong>Purpose:</strong> Maintain valid authentication</li>
+                    <li><strong>Dependencies:</strong> Kodosumi server, Database</li>
+                </ul>
+                
+                <h6 class="mt-4">Flow Sync</h6>
+                <p class="text-muted">Fetches all available flows from the Kodosumi API and updates the local database with the latest information.</p>
+                <ul class="list-unstyled">
+                    <li><strong>Frequency:</strong> Every 30 minutes</li>
+                    <li><strong>Purpose:</strong> Keep flow catalog up-to-date</li>
+                    <li><strong>Dependencies:</strong> API key, Kodosumi server, Database</li>
+                </ul>
+                
+                <h6 class="mt-4">Payment Checker</h6>
+                <p class="text-muted">Monitors for completed payments and updates job status from awaiting_payment to running.</p>
+                <ul class="list-unstyled">
+                    <li><strong>Frequency:</strong> Every minute</li>
+                    <li><strong>Purpose:</strong> Process paid jobs</li>
+                    <li><strong>Dependencies:</strong> Payment service, Database</li>
+                </ul>
+                
+                <h6 class="mt-4">Kodosumi Job Starter</h6>
+                <p class="text-muted">Starts jobs in Kodosumi that are waiting to be processed.</p>
+                <ul class="list-unstyled">
+                    <li><strong>Frequency:</strong> Every minute</li>
+                    <li><strong>Purpose:</strong> Start jobs in Kodosumi</li>
+                    <li><strong>Dependencies:</strong> API key, Kodosumi server, Database</li>
+                    <li><strong>Retry Logic:</strong> 5 attempts before marking as error</li>
+                </ul>
+                
+                <h6 class="mt-4">Kodosumi Status Checker</h6>
+                <p class="text-muted">Checks the status of running jobs in Kodosumi and retrieves results when completed.</p>
+                <ul class="list-unstyled">
+                    <li><strong>Frequency:</strong> Every 2 minutes</li>
+                    <li><strong>Purpose:</strong> Monitor job completion</li>
+                    <li><strong>Dependencies:</strong> API key, Kodosumi server, Database</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="card-title">System Health</h6>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <span>Database Connection</span>
+                        <span class="badge bg-success">Healthy</span>
+                    </div>
+                    <div class="progress mt-1" style="height: 4px;">
+                        <div class="progress-bar bg-success" role="progressbar" style="width: 100%"></div>
+                    </div>
+                </div>
+                
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <span>API Key Status</span>
+                        <span class="badge bg-success" id="api-key-status">Valid</span>
+                    </div>
+                    <div class="progress mt-1" style="height: 4px;">
+                        <div class="progress-bar bg-success" role="progressbar" style="width: 100%"></div>
+                    </div>
+                </div>
+                
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <span>Flow Catalog</span>
+                        <span class="badge bg-info" id="flow-status">Synced</span>
+                    </div>
+                    <div class="progress mt-1" style="height: 4px;">
+                        <div class="progress-bar bg-info" role="progressbar" style="width: 100%"></div>
+                    </div>
+                </div>
+                
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <span>Services</span>
+                        <span class="badge bg-success">Running</span>
+                    </div>
+                    <div class="progress mt-1" style="height: 4px;">
+                        <div class="progress-bar bg-success" role="progressbar" style="width: 100%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadCronJobs() {
+    try {
+        const response = await fetch('/api/cron-status');
+        const data = await response.json();
+        
+        const cronJobsTable = document.getElementById('cron-jobs-table');
+        cronJobsTable.innerHTML = '';
+        
+        if (data.cron_jobs.length === 0) {
+            cronJobsTable.innerHTML = '<tr><td colspan="7" class="text-center">No cron jobs found</td></tr>';
+            return;
+        }
+        
+        data.cron_jobs.forEach(job => {
+            const row = document.createElement('tr');
+            
+            const statusBadge = job.status === 'active' ? 
+                '<span class="badge bg-success"><i class="fas fa-check-circle"></i> Active</span>' : 
+                '<span class="badge bg-danger"><i class="fas fa-times-circle"></i> Inactive</span>';
+            
+            const lastRun = job.last_run ? new Date(job.last_run).toLocaleString() : 'Never';
+            const nextRun = job.next_run ? new Date(job.next_run).toLocaleString() : 'Unknown';
+            
+            // Calculate time until next run (handle timezone properly)
+            let nextRunDisplay = nextRun;
+            if (job.next_run) {
+                const now = new Date();
+                const nextRunTime = new Date(job.next_run + 'Z'); // Ensure UTC interpretation
+                const diff = nextRunTime - now;
+                
+                if (diff > 0) {
+                    const hours = Math.floor(diff / (1000 * 60 * 60));
+                    const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+                    nextRunDisplay = `${new Date(job.next_run + 'Z').toLocaleString()}<br><small class="text-muted">in ${hours}h ${minutes}m</small>`;
+                } else {
+                    nextRunDisplay = `${new Date(job.next_run + 'Z').toLocaleString()}<br><small class="text-warning">Overdue</small>`;
+                }
+            }
+            
+            row.innerHTML = `
+                <td>
+                    <strong>${job.name}</strong>
+                    <br><small class="text-muted">${job.service}</small>
+                </td>
+                <td>
+                    <span class="badge bg-outline-secondary">${job.service}</span>
+                </td>
+                <td>${job.schedule}</td>
+                <td>${statusBadge}</td>
+                <td>${lastRun}</td>
+                <td>${nextRunDisplay}</td>
+                <td>
+                    <span class="badge bg-info">${job.total_executions}</span>
+                </td>
+            `;
+            cronJobsTable.appendChild(row);
+        });
+        
+    } catch (error) {
+        console.error('Error loading cron jobs:', error);
+        document.getElementById('cron-jobs-table').innerHTML = '<tr><td colspan="7" class="text-center text-danger">Error loading cron jobs</td></tr>';
+    }
+}
+
+// Auto-refresh every 30 seconds
+function startAutoRefresh() {
+    setInterval(loadCronJobs, 30000);
+}
+
+// Load cron jobs on page load
+document.addEventListener('DOMContentLoaded', () => {
+    loadCronJobs();
+    startAutoRefresh();
+});
+</script>
+{% endblock %}

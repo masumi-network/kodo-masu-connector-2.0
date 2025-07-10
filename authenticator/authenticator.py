@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+import os
+import time
+import httpx
+import psycopg2
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+KODOSUMI_SERVER_URL = os.getenv('KODOSUMI_SERVER_URL')
+KODOSUMI_USERNAME = os.getenv('KODOSUMI_USERNAME')
+KODOSUMI_PASSWORD = os.getenv('KODOSUMI_PASSWORD')
+
+# Database configuration
+DB_CONFIG = {
+    'host': os.getenv('POSTGRES_HOST'),
+    'port': os.getenv('POSTGRES_PORT'),
+    'database': os.getenv('POSTGRES_DB'),
+    'user': os.getenv('POSTGRES_USER'),
+    'password': os.getenv('POSTGRES_PASSWORD')
+}
+
+def get_db_connection():
+    """Create and return a database connection."""
+    return psycopg2.connect(**DB_CONFIG)
+
+def authenticate_and_get_api_key():
+    """Authenticate with Kodosumi server and retrieve API key."""
+    try:
+        print(f"Authenticating with Kodosumi server at {KODOSUMI_SERVER_URL}")
+        
+        # Try /api/login endpoint with JSON
+        response = httpx.post(
+            f"{KODOSUMI_SERVER_URL}/api/login",
+            json={
+                "name": KODOSUMI_USERNAME,
+                "password": KODOSUMI_PASSWORD
+            },
+            timeout=30.0
+        )
+        
+        if response.status_code == 200:
+            api_key = response.json().get("KODOSUMI_API_KEY")
+            if api_key:
+                print("Successfully authenticated and retrieved API key")
+                return api_key
+            else:
+                print("No API key found in response")
+                return None
+        else:
+            print(f"Authentication failed with status code: {response.status_code}")
+            print(f"Response: {response.text}")
+            return None
+            
+    except Exception as e:
+        print(f"Error during authentication: {str(e)}")
+        return None
+
+def store_api_key(api_key):
+    """Store the API key in the database."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Insert the new API key
+        cursor.execute(
+            "INSERT INTO api_keys (api_key) VALUES (%s)",
+            (api_key,)
+        )
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print(f"API key stored successfully at {datetime.now()}")
+        
+    except Exception as e:
+        print(f"Error storing API key: {str(e)}")
+
+def refresh_api_key():
+    """Main function to refresh the API key."""
+    print(f"\n--- Starting API key refresh at {datetime.now()} ---")
+    
+    api_key = authenticate_and_get_api_key()
+    
+    if api_key:
+        store_api_key(api_key)
+    else:
+        print("Failed to retrieve API key")
+    
+    print("--- API key refresh completed ---\n")
+
+def wait_for_database():
+    """Wait for the database to be ready."""
+    max_retries = 30
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            conn = get_db_connection()
+            conn.close()
+            print("Database is ready!")
+            return True
+        except psycopg2.OperationalError:
+            retry_count += 1
+            print(f"Waiting for database... ({retry_count}/{max_retries})")
+            time.sleep(2)
+    
+    print("Database connection timeout!")
+    return False
+
+def main():
+    """Main entry point for the authenticator service."""
+    print("Starting Kodosumi Authenticator Service")
+    print(f"Server URL: {KODOSUMI_SERVER_URL}")
+    print(f"Username: {KODOSUMI_USERNAME}")
+    
+    # Wait for database to be ready
+    if not wait_for_database():
+        print("Exiting due to database connection failure")
+        return
+    
+    # Run authentication (will be called by cron)
+    refresh_api_key()
+
+if __name__ == "__main__":
+    main()

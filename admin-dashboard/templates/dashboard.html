@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Kodosumi Admin{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card card-stats">
+            <div class="card-body">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <p class="card-category">Total Flows</p>
+                        <h3 class="card-title" id="total-flows">-</h3>
+                    </div>
+                    <div class="align-self-center">
+                        <i class="fas fa-stream fa-2x"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card card-stats-2">
+            <div class="card-body">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <p class="card-category">Active Flows</p>
+                        <h3 class="card-title" id="active-flows">-</h3>
+                    </div>
+                    <div class="align-self-center">
+                        <i class="fas fa-check-circle fa-2x"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card card-stats-3">
+            <div class="card-body">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <p class="card-category">Authors</p>
+                        <h3 class="card-title" id="unique-authors">-</h3>
+                    </div>
+                    <div class="align-self-center">
+                        <i class="fas fa-users fa-2x"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card card-stats-4">
+            <div class="card-body">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <p class="card-category">API Keys</p>
+                        <h3 class="card-title" id="total-api-keys">-</h3>
+                    </div>
+                    <div class="align-self-center">
+                        <i class="fas fa-key fa-2x"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title">Recent Flow Activity</h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-striped">
+                        <thead>
+                            <tr>
+                                <th>Flow Name</th>
+                                <th>Last Updated</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recent-flows">
+                            <tr>
+                                <td colspan="2" class="text-center">Loading...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title">System Status</h5>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>API Key Sync</span>
+                        <span class="status-active"><i class="fas fa-circle"></i> Active</span>
+                    </div>
+                    <small class="text-muted">Every 10 hours</small>
+                </div>
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>Flow Sync</span>
+                        <span class="status-active"><i class="fas fa-circle"></i> Active</span>
+                    </div>
+                    <small class="text-muted">Every 30 minutes</small>
+                </div>
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>Database</span>
+                        <span class="status-active"><i class="fas fa-circle"></i> Connected</span>
+                    </div>
+                    <small class="text-muted">PostgreSQL</small>
+                </div>
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>pgAdmin</span>
+                        <span class="status-active"><i class="fas fa-circle"></i> Running</span>
+                    </div>
+                    <small class="text-muted">Port 8080</small>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadDashboardData() {
+    try {
+        const response = await fetch('/api/stats');
+        const data = await response.json();
+        
+        document.getElementById('total-flows').textContent = data.total_flows;
+        document.getElementById('active-flows').textContent = data.active_flows;
+        document.getElementById('unique-authors').textContent = data.unique_authors;
+        document.getElementById('total-api-keys').textContent = data.total_api_keys;
+        
+        const recentFlowsBody = document.getElementById('recent-flows');
+        recentFlowsBody.innerHTML = '';
+        
+        data.recent_flows.forEach(flow => {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td>${flow.name}</td>
+                <td>${new Date(flow.updated).toLocaleString()}</td>
+            `;
+            recentFlowsBody.appendChild(row);
+        });
+        
+    } catch (error) {
+        console.error('Error loading dashboard data:', error);
+    }
+}
+
+// Load data on page load
+document.addEventListener('DOMContentLoaded', loadDashboardData);
+</script>
+{% endblock %}

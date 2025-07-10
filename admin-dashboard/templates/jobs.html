@@ -1,0 +1,330 @@
+{% extends "base.html" %}
+
+{% block title %}Jobs - Kodosumi Admin{% endblock %}
+
+{% block header %}Jobs Management{% endblock %}
+
+{% block content %}
+<div class="row mb-3">
+    <div class="col-md-6">
+        <div class="input-group">
+            <input type="text" class="form-control" id="search-input" placeholder="Search jobs by ID, flow, or status...">
+            <button class="btn btn-outline-secondary" type="button" onclick="searchJobs()">
+                <i class="fas fa-search"></i>
+            </button>
+        </div>
+    </div>
+    <div class="col-md-6 text-end">
+        <button class="btn btn-primary" onclick="refreshJobs()">
+            <i class="fas fa-sync-alt"></i> Refresh
+        </button>
+        <span id="job-count" class="text-muted ms-3">Loading...</span>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <div id="jobs-container">
+            <!-- Jobs will be populated here as cards -->
+            <div class="text-center">Loading...</div>
+        </div>
+        
+        <nav aria-label="Jobs pagination">
+            <ul class="pagination justify-content-center" id="pagination">
+                <!-- Pagination will be populated by JavaScript -->
+            </ul>
+        </nav>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentPage = 1;
+let currentSearch = '';
+
+async function loadJobs(page = 1, search = '') {
+    try {
+        const response = await fetch(`/api/jobs?page=${page}&per_page=20&search=${encodeURIComponent(search)}`);
+        const data = await response.json();
+        
+        const jobsContainer = document.getElementById('jobs-container');
+        jobsContainer.innerHTML = '';
+        
+        if (data.jobs.length === 0) {
+            jobsContainer.innerHTML = '<div class="text-center">No jobs found</div>';
+            return;
+        }
+        
+        // Fetch detailed data for each job
+        for (const job of data.jobs) {
+            try {
+                const detailResponse = await fetch(`/api/jobs/${job.job_id}`);
+                const jobDetail = await detailResponse.json();
+                
+                if (!jobDetail.error) {
+                    const jobCard = createJobCard(jobDetail);
+                    jobsContainer.appendChild(jobCard);
+                } else {
+                    // Fallback to basic job info if details fail
+                    const jobCard = createBasicJobCard(job);
+                    jobsContainer.appendChild(jobCard);
+                }
+            } catch (error) {
+                console.error(`Error loading details for job ${job.job_id}:`, error);
+                const jobCard = createBasicJobCard(job);
+                jobsContainer.appendChild(jobCard);
+            }
+        }
+        
+        // Update pagination
+        updatePagination(data.page, data.pages);
+        
+        // Update job count
+        document.getElementById('job-count').textContent = `Showing ${data.jobs.length} of ${data.total} jobs`;
+        
+    } catch (error) {
+        console.error('Error loading jobs:', error);
+        document.getElementById('jobs-container').innerHTML = '<div class="text-center text-danger">Error loading jobs</div>';
+    }
+}
+
+function getStatusBadge(status) {
+    const statusMap = {
+        'pending': '<span class="badge bg-secondary">Pending</span>',
+        'awaiting_payment': '<span class="badge bg-warning">Awaiting Payment</span>',
+        'awaiting_input': '<span class="badge bg-info">Awaiting Input</span>',
+        'running': '<span class="badge bg-primary">Running</span>',
+        'completed': '<span class="badge bg-success">Completed</span>',
+        'failed': '<span class="badge bg-danger">Failed</span>',
+        'error': '<span class="badge bg-danger">Error</span>'
+    };
+    return statusMap[status] || `<span class="badge bg-secondary">${status}</span>`;
+}
+
+function createJobCard(job) {
+    const card = document.createElement('div');
+    card.className = 'card mb-3';
+    
+    // Extract payment data fields similar to /start_job response
+    const paymentData = job.payment_data?.data || job.payment_data || {};
+    const requestedFunds = paymentData.RequestedFunds || [];
+    const paymentSource = paymentData.PaymentSource || {};
+    const smartContractWallet = paymentData.SmartContractWallet || {};
+    
+    // Helper function to convert timestamps
+    function formatTimestamp(timestamp) {
+        if (!timestamp || timestamp === 0) return 'N/A';
+        try {
+            // If it's a millisecond timestamp, convert to seconds
+            const ts = timestamp > 10000000000 ? Math.floor(timestamp / 1000) : timestamp;
+            return new Date(ts * 1000).toLocaleString();
+        } catch {
+            return 'Invalid';
+        }
+    }
+    
+    // Format amounts
+    const amountsHtml = requestedFunds.map(fund => {
+        const amount = parseInt(fund.amount || 0);
+        const unit = fund.unit || 'unknown';
+        if (unit.toLowerCase().includes('lovelace') && amount > 0) {
+            return `<div><strong>${(amount / 1000000).toFixed(6)} ADA</strong> (${amount.toLocaleString()} lovelace)</div>`;
+        }
+        return `<div><strong>${amount.toLocaleString()}</strong> ${unit}</div>`;
+    }).join('') || '<div class="text-muted">No amounts specified</div>';
+    
+    // Use the flow's configured agent identifier, with fallback to payment data
+    let agentIdentifier = job.flow_agent_identifier || '';
+    if (!agentIdentifier) {
+        // Fallback: Extract from policy ID if no flow agent identifier is configured
+        const policyId = paymentSource.policyId || '';
+        agentIdentifier = policyId.slice(0, 57) || 'N/A';
+    } else if (agentIdentifier === 'N/A') {
+        agentIdentifier = 'N/A';
+    }
+    
+    card.innerHTML = `
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <div>
+                <h6 class="mb-0">
+                    <code>${job.job_id.substring(0, 8)}...</code>
+                    <button class="btn btn-sm btn-link p-0 ms-1" onclick="copyToClipboard('${job.job_id}')">
+                        <i class="fas fa-copy"></i>
+                    </button>
+                </h6>
+                <small class="text-muted">${job.flow_summary || job.flow_uid}</small>
+            </div>
+            <div>
+                ${getStatusBadge(job.status)}
+            </div>
+        </div>
+        <div class="card-body">
+            <div class="row">
+                <div class="col-md-4">
+                    <h6>Payment Information</h6>
+                    <table class="table table-sm table-borderless">
+                        <tr><td><strong>Blockchain ID:</strong></td><td><code class="small">${job.blockchain_identifier ? job.blockchain_identifier.substring(0, 16) + '...' : 'N/A'}</code> ${job.blockchain_identifier ? `<button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.blockchain_identifier}')"><i class="fas fa-copy"></i></button>` : ''}</td></tr>
+                        <tr><td><strong>Purchaser ID:</strong></td><td><code class="small">${job.identifier_from_purchaser}</code></td></tr>
+                        <tr><td><strong>Input Hash:</strong></td><td><code class="small">${job.input_hash || paymentData.inputHash || 'N/A'}</code></td></tr>
+                        <tr><td><strong>Agent ID:</strong></td><td><code class="small">${agentIdentifier}</code></td></tr>
+                        <tr><td><strong>Waiting for Kodosumi:</strong></td><td>${job.waiting_for_start_in_kodosumi ? '<span class="badge bg-warning">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td></tr>
+                        ${job.kodosumi_fid ? `<tr><td><strong>Kodosumi FID:</strong></td><td><code class="small">${job.kodosumi_fid}</code> <button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.kodosumi_fid}')"><i class="fas fa-copy"></i></button></td></tr>` : ''}
+                        ${job.kodosumi_start_attempts > 0 ? `<tr><td><strong>Start Attempts:</strong></td><td>${job.kodosumi_start_attempts}/5</td></tr>` : ''}
+                    </table>
+                </div>
+                <div class="col-md-4">
+                    <h6>Timing Information</h6>
+                    <table class="table table-sm table-borderless">
+                        <tr><td><strong>Submit Result:</strong></td><td>${formatTimestamp(paymentData.submitResultTime)}</td></tr>
+                        <tr><td><strong>Unlock Time:</strong></td><td>${formatTimestamp(paymentData.unlockTime)}</td></tr>
+                        <tr><td><strong>Dispute Unlock:</strong></td><td>${formatTimestamp(paymentData.externalDisputeUnlockTime)}</td></tr>
+                        <tr><td><strong>Created:</strong></td><td>${new Date(job.created_at).toLocaleString()}</td></tr>
+                    </table>
+                </div>
+                <div class="col-md-4">
+                    <h6>Payment Details</h6>
+                    <div class="mb-2">
+                        <strong>Amounts:</strong>
+                        ${amountsHtml}
+                    </div>
+                    ${smartContractWallet.walletVkey ? `
+                    <div class="mb-2">
+                        <strong>Seller VKey:</strong>
+                        <code class="small d-block">${smartContractWallet.walletVkey.substring(0, 20)}...</code>
+                        <button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${smartContractWallet.walletVkey}')">
+                            <i class="fas fa-copy"></i> Copy Full
+                        </button>
+                    </div>
+                    ` : ''}
+                    ${job.message ? `<div><strong>Message:</strong> ${job.message}</div>` : ''}
+                </div>
+            </div>
+        </div>
+    `;
+    
+    return card;
+}
+
+function createBasicJobCard(job) {
+    const card = document.createElement('div');
+    card.className = 'card mb-3';
+    
+    card.innerHTML = `
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <div>
+                <h6 class="mb-0">
+                    <code>${job.job_id.substring(0, 8)}...</code>
+                    <button class="btn btn-sm btn-link p-0 ms-1" onclick="copyToClipboard('${job.job_id}')">
+                        <i class="fas fa-copy"></i>
+                    </button>
+                </h6>
+                <small class="text-muted">${job.flow_summary || job.flow_uid}</small>
+            </div>
+            <div>
+                ${getStatusBadge(job.status)}
+            </div>
+        </div>
+        <div class="card-body">
+            <div class="row">
+                <div class="col-md-6">
+                    <table class="table table-sm table-borderless">
+                        <tr><td><strong>Blockchain ID:</strong></td><td><code class="small">${job.blockchain_identifier ? job.blockchain_identifier.substring(0, 16) + '...' : 'N/A'}</code> ${job.blockchain_identifier ? `<button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.blockchain_identifier}')"><i class="fas fa-copy"></i></button>` : ''}</td></tr>
+                        <tr><td><strong>Purchaser ID:</strong></td><td><code class="small">${job.identifier_from_purchaser}</code></td></tr>
+                        <tr><td><strong>Waiting for Kodosumi:</strong></td><td>${job.waiting_for_start_in_kodosumi ? '<span class="badge bg-warning">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td></tr>
+                        ${job.kodosumi_fid ? `<tr><td><strong>Kodosumi FID:</strong></td><td><code class="small">${job.kodosumi_fid}</code> <button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.kodosumi_fid}')"><i class="fas fa-copy"></i></button></td></tr>` : ''}
+                        ${job.kodosumi_start_attempts > 0 ? `<tr><td><strong>Start Attempts:</strong></td><td>${job.kodosumi_start_attempts}/5</td></tr>` : ''}
+                        <tr><td><strong>Created:</strong></td><td>${new Date(job.created_at).toLocaleString()}</td></tr>
+                        <tr><td><strong>Updated:</strong></td><td>${new Date(job.updated_at).toLocaleString()}</td></tr>
+                    </table>
+                </div>
+                <div class="col-md-6">
+                    <div class="alert alert-warning">
+                        <i class="fas fa-exclamation-triangle"></i>
+                        Unable to load full job details
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    return card;
+}
+
+function updatePagination(currentPage, totalPages) {
+    const pagination = document.getElementById('pagination');
+    pagination.innerHTML = '';
+    
+    if (totalPages <= 1) return;
+    
+    // Previous button
+    const prevLi = document.createElement('li');
+    prevLi.className = `page-item ${currentPage === 1 ? 'disabled' : ''}`;
+    prevLi.innerHTML = `<a class="page-link" href="#" onclick="changePage(${currentPage - 1})">Previous</a>`;
+    pagination.appendChild(prevLi);
+    
+    // Page numbers
+    for (let i = Math.max(1, currentPage - 2); i <= Math.min(totalPages, currentPage + 2); i++) {
+        const li = document.createElement('li');
+        li.className = `page-item ${i === currentPage ? 'active' : ''}`;
+        li.innerHTML = `<a class="page-link" href="#" onclick="changePage(${i})">${i}</a>`;
+        pagination.appendChild(li);
+    }
+    
+    // Next button
+    const nextLi = document.createElement('li');
+    nextLi.className = `page-item ${currentPage === totalPages ? 'disabled' : ''}`;
+    nextLi.innerHTML = `<a class="page-link" href="#" onclick="changePage(${currentPage + 1})">Next</a>`;
+    pagination.appendChild(nextLi);
+}
+
+function changePage(page) {
+    if (page < 1) return;
+    currentPage = page;
+    loadJobs(page, currentSearch);
+}
+
+function searchJobs() {
+    currentSearch = document.getElementById('search-input').value;
+    currentPage = 1;
+    loadJobs(1, currentSearch);
+}
+
+function refreshJobs() {
+    loadJobs(currentPage, currentSearch);
+}
+
+
+function copyToClipboard(text) {
+    navigator.clipboard.writeText(text).then(() => {
+        // Show success feedback
+        const button = event.target.closest('button');
+        const originalHTML = button.innerHTML;
+        button.innerHTML = '<i class="fas fa-check"></i>';
+        setTimeout(() => {
+            button.innerHTML = originalHTML;
+        }, 1000);
+    }).catch(err => {
+        console.error('Failed to copy:', err);
+    });
+}
+
+// Search on Enter key
+document.getElementById('search-input').addEventListener('keypress', function(e) {
+    if (e.key === 'Enter') {
+        searchJobs();
+    }
+});
+
+// Load jobs on page load
+document.addEventListener('DOMContentLoaded', () => loadJobs());
+
+// Auto-refresh every 30 seconds
+setInterval(() => {
+    if (!document.hidden) {
+        loadJobs(currentPage, currentSearch);
+    }
+}, 30000);
+</script>
+{% endblock %}
