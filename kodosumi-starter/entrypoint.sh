@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Export all environment variables for cron
-printenv | grep -v "no_proxy" >> /etc/environment
+# Export all environment variables for cron with proper escaping
+printenv | grep -v "no_proxy" | sed 's/=\(.*\)/="\1"/' | sed 's/^/export /' > /etc/environment
 
 # Start cron in the background
 cron
