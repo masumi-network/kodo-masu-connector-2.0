@@ -54,14 +54,14 @@ This document describes the robustness features implemented to handle high concu
 
 ## Testing
 
-Run the robustness test suite:
+The robustness features can be tested with load testing tools like Apache Bench (ab), wrk, or custom scripts:
 
 ```bash
-# Run comprehensive test suite
-python api-server/test_robustness.py
+# Example using Apache Bench
+ab -n 1000 -c 50 http://localhost:8000/health
 
-# Test with custom concurrent requests
-python api-server/test_robustness.py 1000
+# Example using wrk
+wrk -t12 -c400 -d30s http://localhost:8000/health
 ```
 
 ## Monitoring

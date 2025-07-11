@@ -23,7 +23,7 @@ COPY shared/cron_logger.py .
 COPY api-server/ /app/api-server/
 
 # Make scripts executable
-RUN chmod +x run_status_checker.py
+RUN chmod +x run_status_checker_with_logging.py
 
 # Copy crontab file
 COPY kodosumi-status/crontab /etc/cron.d/kodosumi-status

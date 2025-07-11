@@ -9,7 +9,7 @@ echo "Status checks will run every 2 minutes"
 
 # Run initial check immediately
 echo "Running initial status check..."
-python /app/run_status_checker.py
+python /app/run_status_checker_with_logging.py
 
 # Start cron and tail the log
 cron && tail -f /var/log/cron.log

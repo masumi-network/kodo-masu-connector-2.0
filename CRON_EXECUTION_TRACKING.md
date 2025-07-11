@@ -74,7 +74,7 @@ GROUP BY service_name
    - flow-sync/flow_sync.py
    - payment-checker/payment_checker.py
    - kodosumi-starter/kodosumi_starter.py
-   - kodosumi-status/run_status_checker.py
+   - kodosumi-status/run_status_checker_with_logging.py
 
 3. **Update admin dashboard** to use the new queries
 
