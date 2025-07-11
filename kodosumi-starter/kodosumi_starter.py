@@ -15,6 +15,7 @@ import os
 import json
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
+from cron_logger import CronExecutionLogger
 
 # Load environment variables
 load_dotenv()
@@ -237,6 +238,13 @@ class KodosumiStarter:
     
     async def process_jobs(self):
         """Main process to start jobs in Kodosumi."""
+        # Initialize cron logger
+        cron_logger = CronExecutionLogger('kodosumi-starter', self.database_url)
+        await cron_logger.log_start()
+        
+        items_processed = 0
+        error = None
+        
         try:
             # Connect to database
             conn = await asyncpg.connect(self.database_url)
@@ -290,6 +298,7 @@ class KodosumiStarter:
                     
                     if success:
                         logger.info(f"Successfully processed job {job_id}")
+                        items_processed += 1  # Count successful starts
                     else:
                         logger.error(f"Failed to update job {job_id} in database")
                 else:
@@ -309,8 +318,12 @@ class KodosumiStarter:
             logger.info("Kodosumi job starting completed successfully")
             
         except Exception as e:
+            error = str(e)
             logger.error(f"Error in Kodosumi job processing: {e}")
             raise
+            
+        finally:
+            await cron_logger.log_completion(items_processed, error)
 
 async def main():
     """Main entry point for the Kodosumi starter."""

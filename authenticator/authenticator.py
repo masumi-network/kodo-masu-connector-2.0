@@ -5,6 +5,8 @@ import httpx
 import psycopg2
 from datetime import datetime
 from dotenv import load_dotenv
+import asyncio
+from cron_logger import CronExecutionLogger
 
 # Load environment variables
 load_dotenv()
@@ -80,18 +82,41 @@ def store_api_key(api_key):
     except Exception as e:
         print(f"Error storing API key: {str(e)}")
 
+async def refresh_api_key_with_logging():
+    """Main function to refresh the API key with execution logging."""
+    # Build database URL for cron logger
+    database_url = f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@{os.getenv('POSTGRES_HOST', 'postgres')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB')}"
+    
+    cron_logger = CronExecutionLogger('authenticator', database_url)
+    await cron_logger.log_start()
+    
+    items_processed = 0
+    error = None
+    
+    try:
+        print(f"\n--- Starting API key refresh at {datetime.now()} ---")
+        
+        api_key = authenticate_and_get_api_key()
+        
+        if api_key:
+            store_api_key(api_key)
+            items_processed = 1  # Successfully stored 1 API key
+        else:
+            error = "Failed to retrieve API key"
+            print(error)
+        
+        print("--- API key refresh completed ---\n")
+        
+    except Exception as e:
+        error = str(e)
+        print(f"Error in API key refresh: {error}")
+        
+    finally:
+        await cron_logger.log_completion(items_processed, error)
+
 def refresh_api_key():
-    """Main function to refresh the API key."""
-    print(f"\n--- Starting API key refresh at {datetime.now()} ---")
-    
-    api_key = authenticate_and_get_api_key()
-    
-    if api_key:
-        store_api_key(api_key)
-    else:
-        print("Failed to retrieve API key")
-    
-    print("--- API key refresh completed ---\n")
+    """Wrapper to run async function."""
+    asyncio.run(refresh_api_key_with_logging())
 
 def wait_for_database():
     """Wait for the database to be ready."""

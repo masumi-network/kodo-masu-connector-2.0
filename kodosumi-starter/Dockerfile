@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY kodosumi-starter/ .
 
+# Copy shared cron logger module
+COPY shared/cron_logger.py .
+
 # Make the run script executable
 RUN chmod +x run_starter.py
 

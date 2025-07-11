@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from masumi.payment import Payment
 from masumi.config import Config as MasumiConfig
+from cron_logger import CronExecutionLogger
 
 # Load environment variables
 load_dotenv()
@@ -138,6 +139,13 @@ class PaymentChecker:
     
     async def process_payments(self):
         """Main process to check payments and update job statuses."""
+        # Initialize cron logger
+        cron_logger = CronExecutionLogger('payment-checker', self.database_url)
+        await cron_logger.log_start()
+        
+        items_processed = 0
+        error = None
+        
         try:
             # Connect to database
             conn = await asyncpg.connect(self.database_url)
@@ -209,6 +217,7 @@ class PaymentChecker:
                     
                     if success:
                         logger.info(f"Successfully updated job {job['job_id']} to 'running' status")
+                        items_processed += 1  # Count successful updates
                     else:
                         logger.error(f"Failed to update job {job['job_id']} status")
                 else:
@@ -218,8 +227,12 @@ class PaymentChecker:
             logger.info("Payment checking completed successfully")
             
         except Exception as e:
+            error = str(e)
             logger.error(f"Error in payment processing: {e}")
             raise
+            
+        finally:
+            await cron_logger.log_completion(items_processed, error)
 
 async def main():
     """Main entry point for the payment checker."""

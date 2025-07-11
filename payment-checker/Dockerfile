@@ -17,6 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY payment-checker/ .
 
+# Copy shared cron logger module
+COPY shared/cron_logger.py .
+
 # Make the scripts executable
 RUN chmod +x payment_checker.py run_checker.py
 

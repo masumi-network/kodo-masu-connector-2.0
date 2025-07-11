@@ -1,0 +1,19 @@
+services:
+  # Override api-server to remove container_name for scaling
+  api-server:
+    # Remove container_name to allow multiple instances
+    container_name: !reset
+    # Remove ports as nginx will handle them
+    ports: !reset
+
+  # Add nginx load balancer
+  nginx:
+    image: nginx:alpine
+    container_name: kodosumi-nginx
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-server
+    restart: unless-stopped

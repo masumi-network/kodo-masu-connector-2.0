@@ -1,94 +1,133 @@
-# Kodosumi Service
+# Kodo-Masu Connector 2.0
 
-A multi-component service for managing Kodosumi API authentication and providing MIP-003 compliant agentic service endpoints with PostgreSQL database storage.
+A robust, scalable bridge between Kodosumi AI workflows and Masumi blockchain payments, providing MIP-003 compliant endpoints for AI agents.
 
-## Components
+## Quick Start
 
-1. **PostgreSQL Database**: Stores API keys, flows, and job data with timestamps
-2. **Authenticator Service**: Runs every 10 hours to fetch new API keys from Kodosumi server
-3. **Flow Sync Service**: Synchronizes flows from Kodosumi and converts them to MIP-003 format
-4. **API Server**: Provides MIP-003 compliant endpoints for agentic service interactions
-5. **Admin Dashboard**: Web interface for managing flows and monitoring jobs
+```bash
+# Install Docker (if needed)
+bash install-docker.sh
 
-## Setup
+# Configure environment
+cp .env.example .env
+# Edit .env with your settings
 
-1. Copy the example environment file and configure it:
-   ```bash
-   cp .env.example .env
-   ```
+# Deploy (choose one)
+bash startup.sh        # Single instance deployment
+bash deploy-scaled.sh  # Production deployment with load balancer
+```
 
-2. Configure the `.env` file with your settings:
-   ```
-   # Database Configuration
-   POSTGRES_HOST=postgres
-   POSTGRES_PORT=5432
-   POSTGRES_DB=kodosumi
-   POSTGRES_USER=postgres
-   POSTGRES_PASSWORD=your_postgres_password
+## Architecture Overview
 
-   # Kodosumi API Configuration
-   KODOSUMI_SERVER_URL=http://localhost:3370
-   KODOSUMI_USERNAME=admin
-   KODOSUMI_PASSWORD=admin
+### Core Services
 
-   # Masumi Payment Service Configuration
-   PAYMENT_SERVICE_URL=https://api.masumi.network
-   PAYMENT_API_KEY=your_masumi_payment_api_key
-   AGENT_IDENTIFIER=kodosumi-service
-   NETWORK=Preprod
-   ```
+| Service | Purpose | Schedule |
+|---------|---------|----------|
+| **API Server** | MIP-003 compliant REST API | Always on |
+| **PostgreSQL** | Data persistence | Always on |
+| **Authenticator** | Kodosumi API key management | Every 10 hours |
+| **Flow Sync** | Workflow synchronization | Every 2 hours |
+| **Payment Checker** | Blockchain payment verification | Every 5 minutes |
+| **Kodosumi Starter** | Job submission to Kodosumi | Every 2 minutes |
+| **Kodosumi Status** | Job completion monitoring | Every 2 minutes |
+| **Admin Dashboard** | Web management interface | Always on |
+| **Nginx** (scaled only) | Load balancer | Always on |
 
-3. Run the startup script:
-   ```bash
-   ./startup.sh
-   ```
+### Data Flow
 
-## Manual Commands
-
-- Start services: `docker-compose up -d`
-- View logs: `docker-compose logs -f`
-- Stop services: `docker-compose down`
-- Remove all data: `docker-compose down -v`
+```
+User → API → Payment Verification → Kodosumi → Results → Payment Completion
+         ↓                                                      ↑
+    PostgreSQL ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ↓
+```
 
 ## API Endpoints
 
-The API server provides MIP-003 compliant endpoints for each flow. For a flow with UID `flow123`, the endpoints are:
+For each workflow (identified by `{flow_uid}`):
 
-- `POST /{flow_uid}/start_job` - Start a new job
-- `GET /{flow_uid}/status?job_id={job_id}` - Check job status
-- `POST /{flow_uid}/provide_input` - Provide additional input (optional)
-- `GET /{flow_uid}/availability` - Check service availability
-- `GET /{flow_uid}/input_schema` - Get input schema
+- `POST /{flow_uid}/start_job` - Start a new job with payment
+- `GET /{flow_uid}/status` - Check job status
+- `GET /{flow_uid}/availability` - Service availability
+- `GET /{flow_uid}/input_schema` - Required input format
+- `GET /health` - System health check
+- `GET /metrics` - Prometheus metrics (scaled deployment)
 
-Example:
+## Key Features
+
+### Robustness
+- Rate limiting (60 req/min per endpoint)
+- Circuit breakers for external services
+- Multi-level caching
+- Automatic retries
+- Request timeouts
+
+### Scalability
+- Horizontal scaling (3 instances in production)
+- Load balancing with health checks
+- Connection pooling
+- 48 total workers in scaled deployment
+
+### Payment Integration
+- Masumi blockchain payment verification
+- Automatic payment completion
+- Database-based configuration
+- MIP-003 compliance
+
+### Monitoring & Observability
+- Cron execution tracking
+- Performance metrics per service
+- Success/failure rate monitoring
+- Execution history in admin dashboard
+
+## Deployment Options
+
+### Basic (Single Instance)
+- 1 API server with 16 workers
+- Suitable for development/low traffic
+- ~100 concurrent users
+
+### Scaled (Production)
+- 3 API servers with 48 total workers
+- Nginx load balancer
+- High availability
+- ~300+ concurrent users
+
+## Access Points
+
+| Service | Basic Deploy | Scaled Deploy |
+|---------|--------------|---------------|
+| API | http://localhost:8000 | http://localhost |
+| API Docs | http://localhost:8000/docs | http://localhost/docs |
+| Admin Dashboard | http://localhost:3001 | http://localhost:3001 |
+| pgAdmin | http://localhost:5050 | http://localhost:5050 |
+| Metrics | N/A | http://localhost/metrics |
+
+## Monitoring
+
 ```bash
-# Get input schema for flow "youtube-analyzer"
-curl http://localhost:8000/youtube-analyzer/input_schema
+# Real-time request monitoring (scaled deployment)
+python3 monitor.py
 
-# Start a job
-curl -X POST http://localhost:8000/youtube-analyzer/start_job \
-  -H "Content-Type: application/json" \
-  -d '{
-    "identifier_from_purchaser": "my-job-123",
-    "input_data": {
-      "queries": "Analyze this YouTube channel..."
-    }
-  }'
+# View logs
+docker logs -f <service-name>
+
+# Check metrics
+curl http://localhost/metrics
 ```
 
-## Services Access
+## Documentation
 
-- **API Server**: http://localhost:8000
-- **Admin Dashboard**: http://localhost:5000
-- **PgAdmin**: http://localhost:8080
-- **API Documentation**: http://localhost:8000/docs
+- [Deployment Guide](DEPLOYMENT.md) - Detailed deployment instructions
+- [Deployment Summary](DEPLOYMENT-SUMMARY.md) - What's included in each deployment
+- [Monitoring Commands](monitoring-commands.md) - Useful monitoring queries
 
-## Testing
+## Requirements
 
-The test script runs automatically during startup. To run manually:
-```bash
-cd scripts
-pip install -r requirements.txt
-python test_authentication.py
-python test_flow_sync.py
-```
+- Ubuntu 20.04+ or similar Linux
+- 4GB RAM minimum (8GB for scaled deployment)
+- Docker and Docker Compose
+- 20GB free disk space
+
+## License
+
+[Your License Here]

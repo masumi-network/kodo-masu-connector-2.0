@@ -17,5 +17,7 @@ COPY api-server/ .
 # Expose port
 EXPOSE 8000
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Run the application with more workers for better concurrency
+# Increased to 16 workers for handling high load on availability endpoints
+# Also added worker-connections for better handling of concurrent connections
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "16", "--loop", "uvloop", "--limit-concurrency", "1000"]

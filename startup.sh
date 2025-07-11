@@ -33,6 +33,15 @@ docker compose ps
 echo "Waiting for database and services to be fully ready..."
 sleep 20
 
+# Apply database migrations
+if [ -f ./scripts/apply_migrations.sh ]; then
+    echo ""
+    ./scripts/apply_migrations.sh
+    echo ""
+else
+    echo "Warning: Migration script not found at ./scripts/apply_migrations.sh"
+fi
+
 # Services are now ready
 
 echo "Startup complete!"

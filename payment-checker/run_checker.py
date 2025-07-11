@@ -43,10 +43,10 @@ class PaymentCheckerService:
                 elapsed = time.time() - start_time
                 logger.info(f"Payment check cycle completed in {elapsed:.2f} seconds")
                 
-                # Wait for 60 seconds before next check
+                # Wait for 120 seconds (2 minutes) before next check
                 if self.running:
-                    logger.info("Waiting 60 seconds before next check...")
-                    await asyncio.sleep(60)
+                    logger.info("Waiting 120 seconds before next check...")
+                    await asyncio.sleep(120)
                     
             except Exception as e:
                 logger.error(f"Error in payment checker service: {e}")

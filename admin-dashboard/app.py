@@ -3,7 +3,7 @@ from flask import Flask, render_template, jsonify, request
 import psycopg2
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -149,50 +149,49 @@ def api_cron_status():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Get API key sync status
+        # Get execution counts from cron_executions table (last 7 days)
         cursor.execute("""
-            SELECT COUNT(*) as total_keys, 
-                   MAX(created_at) as last_sync
-            FROM api_keys
+            SELECT 
+                service_name,
+                COUNT(*) as total_executions,
+                COUNT(CASE WHEN status = 'completed' THEN 1 END) as successful_executions,
+                COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_executions,
+                MAX(execution_time) as last_execution,
+                AVG(duration_ms) as avg_duration_ms,
+                SUM(items_processed) as total_items_processed
+            FROM cron_executions
+            WHERE execution_time > NOW() - INTERVAL '7 days'
+            GROUP BY service_name
         """)
-        api_key_result = cursor.fetchone()
+        execution_stats = {}
+        for row in cursor.fetchall():
+            execution_stats[row[0]] = {
+                'total_executions': row[1],
+                'successful_executions': row[2],
+                'failed_executions': row[3],
+                'last_execution': row[4],
+                'avg_duration_ms': float(row[5]) if row[5] else 0,
+                'total_items_processed': row[6] or 0
+            }
         
-        # Get flow sync status
+        # Get last successful run details
         cursor.execute("""
-            SELECT COUNT(*) as total_flows, 
-                   MAX(updated_at) as last_sync
-            FROM flows
+            SELECT DISTINCT ON (service_name) 
+                service_name,
+                execution_time,
+                items_processed,
+                duration_ms
+            FROM cron_executions
+            WHERE status = 'completed'
+            ORDER BY service_name, execution_time DESC
         """)
-        flow_result = cursor.fetchone()
-        
-        # Get payment checker status (jobs updated from awaiting_payment to running)
-        cursor.execute("""
-            SELECT COUNT(*) as jobs_processed, 
-                   MAX(updated_at) as last_run
-            FROM jobs 
-            WHERE status = 'running' AND waiting_for_start_in_kodosumi = true
-        """)
-        payment_checker_result = cursor.fetchone()
-        
-        # Get Kodosumi starter status (jobs with waiting_for_start_in_kodosumi set to false)
-        cursor.execute("""
-            SELECT COUNT(*) as jobs_started, 
-                   MAX(updated_at) as last_run
-            FROM jobs 
-            WHERE waiting_for_start_in_kodosumi = false 
-            AND result::text LIKE '%kodosumi_fid%'
-        """)
-        kodosumi_starter_result = cursor.fetchone()
-        
-        # Get Kodosumi status checker results (completed jobs)
-        cursor.execute("""
-            SELECT COUNT(*) as jobs_completed, 
-                   MAX(updated_at) as last_run
-            FROM jobs 
-            WHERE status = 'completed' 
-            AND result::text LIKE '%final_result%'
-        """)
-        kodosumi_status_result = cursor.fetchone()
+        last_successful_runs = {}
+        for row in cursor.fetchall():
+            last_successful_runs[row[0]] = {
+                'time': row[1],
+                'items_processed': row[2],
+                'duration_ms': row[3]
+            }
         
         cursor.close()
         conn.close()
@@ -200,100 +199,122 @@ def api_cron_status():
         # Calculate next run times based on actual cron schedule
         now = datetime.now()
         
-        # API key sync: "0 */10 * * *" - runs at 0:00, 10:00, 20:00 daily
-        last_api_sync = api_key_result[1] if api_key_result[1] else now
-        # Find next scheduled time
-        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        scheduled_times = [
-            today.replace(hour=0),   # 00:00 today
-            today.replace(hour=10),  # 10:00 today  
-            today.replace(hour=20)   # 20:00 today
-        ]
-        
-        # Find the next scheduled time after now
-        next_api_sync = None
-        for scheduled_time in scheduled_times:
-            if scheduled_time > now:
-                next_api_sync = scheduled_time
-                break
-        
-        # If no time today, use 00:00 tomorrow
-        if not next_api_sync:
-            next_api_sync = (today + timedelta(days=1)).replace(hour=0)
-        
-        # Flow sync: "*/30 * * * *" - runs every 30 minutes (0, 30 minutes past each hour)
-        last_flow_sync = flow_result[1] if flow_result[1] else now
-        # Calculate next 30-minute boundary
-        current_minute = now.minute
-        if current_minute < 30:
-            next_flow_sync = now.replace(minute=30, second=0, microsecond=0)
-        else:
-            next_flow_sync = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-        
-        # Calculate next run time for payment checker (every minute)
-        last_payment_check = payment_checker_result[1] if payment_checker_result[1] else now
-        next_payment_check = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-        
-        # Calculate next run time for Kodosumi starter (every minute)
-        last_kodosumi_start = kodosumi_starter_result[1] if kodosumi_starter_result[1] else now
-        next_kodosumi_start = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-        
-        # Calculate next run time for Kodosumi status checker (every 2 minutes)
-        last_kodosumi_status = kodosumi_status_result[1] if kodosumi_status_result[1] else now
-        # Round up to next even minute
-        current_minute = now.minute
-        if current_minute % 2 == 0:
-            next_kodosumi_status = now.replace(second=0, microsecond=0) + timedelta(minutes=2)
-        else:
-            next_kodosumi_status = now.replace(second=0, microsecond=0) + timedelta(minutes=(2 - current_minute % 2))
-        
-        cron_jobs = [
+        # Define service configurations
+        services = [
             {
                 'name': 'API Key Sync',
                 'service': 'authenticator',
                 'schedule': 'Every 10 hours',
-                'last_run': last_api_sync.isoformat() if last_api_sync else None,
-                'next_run': next_api_sync.isoformat() if next_api_sync else None,
-                'status': 'active' if api_key_result[0] > 0 else 'inactive',
-                'total_executions': api_key_result[0]
+                'schedule_cron': '0 */10 * * *'
             },
             {
-                'name': 'Flow Sync',
+                'name': 'Flow Sync', 
                 'service': 'flow-sync',
                 'schedule': 'Every 30 minutes',
-                'last_run': last_flow_sync.isoformat() if last_flow_sync else None,
-                'next_run': next_flow_sync.isoformat() if next_flow_sync else None,
-                'status': 'active' if flow_result[0] > 0 else 'inactive',
-                'total_executions': flow_result[0]
+                'schedule_cron': '*/30 * * * *'
             },
             {
                 'name': 'Payment Checker',
-                'service': 'payment-checker',
-                'schedule': 'Every minute',
-                'last_run': last_payment_check.isoformat() if last_payment_check else None,
-                'next_run': next_payment_check.isoformat() if next_payment_check else None,
-                'status': 'active' if payment_checker_result[0] > 0 else 'inactive',
-                'total_executions': payment_checker_result[0]
+                'service': 'payment-checker', 
+                'schedule': 'Every 2 minutes',
+                'schedule_cron': '*/2 * * * *'
             },
             {
                 'name': 'Kodosumi Job Starter',
                 'service': 'kodosumi-starter',
                 'schedule': 'Every minute',
-                'last_run': last_kodosumi_start.isoformat() if last_kodosumi_start else None,
-                'next_run': next_kodosumi_start.isoformat() if next_kodosumi_start else None,
-                'status': 'active' if kodosumi_starter_result[0] > 0 else 'inactive',
-                'total_executions': kodosumi_starter_result[0]
+                'schedule_cron': '* * * * *'
             },
             {
                 'name': 'Kodosumi Status Checker',
                 'service': 'kodosumi-status',
-                'schedule': 'Every 2 minutes',
-                'last_run': last_kodosumi_status.isoformat() if last_kodosumi_status else None,
-                'next_run': next_kodosumi_status.isoformat() if next_kodosumi_status else None,
-                'status': 'active' if kodosumi_status_result[0] > 0 else 'inactive',
-                'total_executions': kodosumi_status_result[0]
+                'schedule': 'Every 2 minutes', 
+                'schedule_cron': '*/2 * * * *'
             }
         ]
+        
+        cron_jobs = []
+        for service_config in services:
+            service_name = service_config['service']
+            stats = execution_stats.get(service_name, {})
+            last_successful = last_successful_runs.get(service_name, {})
+            
+            # Calculate health status
+            if stats.get('total_executions', 0) == 0:
+                status = 'never_run'
+            elif stats.get('failed_executions', 0) > stats.get('successful_executions', 0):
+                status = 'unhealthy'
+            elif last_successful.get('time'):
+                # Check if last successful run was recent enough
+                last_run_time = last_successful['time']
+                time_since_last = (now - last_run_time).total_seconds()
+                
+                # Expected intervals in seconds
+                expected_intervals = {
+                    'authenticator': 36000,      # 10 hours
+                    'flow-sync': 1800,          # 30 minutes
+                    'payment-checker': 120,     # 2 minutes
+                    'kodosumi-starter': 60,     # 1 minute
+                    'kodosumi-status': 120      # 2 minutes
+                }
+                
+                expected_interval = expected_intervals.get(service_name, 3600)
+                if time_since_last > expected_interval * 2:
+                    status = 'warning'
+                else:
+                    status = 'healthy'
+            else:
+                status = 'unknown'
+            
+            # Calculate next run based on last execution
+            last_exec = stats.get('last_execution')
+            if last_exec:
+                if service_name == 'authenticator':
+                    # Next 10-hour boundary
+                    hour = last_exec.hour
+                    next_hour = ((hour // 10) + 1) * 10
+                    if next_hour >= 24:
+                        next_run = (last_exec.replace(hour=0, minute=0, second=0) + timedelta(days=1))
+                    else:
+                        next_run = last_exec.replace(hour=next_hour, minute=0, second=0)
+                elif service_name == 'flow-sync':
+                    # Next 30-minute boundary
+                    next_run = last_exec + timedelta(minutes=30)
+                elif service_name == 'payment-checker':
+                    # Next 2-minute boundary
+                    next_run = last_exec + timedelta(minutes=2)
+                elif service_name == 'kodosumi-starter':
+                    # Next minute
+                    next_run = last_exec + timedelta(minutes=1)
+                elif service_name == 'kodosumi-status':
+                    # Next 2-minute boundary
+                    next_run = last_exec + timedelta(minutes=2)
+                else:
+                    next_run = None
+            else:
+                next_run = now + timedelta(minutes=1)
+            
+            cron_job = {
+                'name': service_config['name'],
+                'service': service_name,
+                'schedule': service_config['schedule'],
+                'schedule_cron': service_config['schedule_cron'],
+                'status': status,
+                'total_executions': stats.get('total_executions', 0),
+                'successful_executions': stats.get('successful_executions', 0),
+                'failed_executions': stats.get('failed_executions', 0), 
+                'total_items_processed': stats.get('total_items_processed', 0),
+                'avg_duration_ms': stats.get('avg_duration_ms', 0),
+                'last_execution': stats.get('last_execution').isoformat() + 'Z' if stats.get('last_execution') else None,
+                'last_successful_run': {
+                    'time': last_successful.get('time').isoformat() + 'Z' if last_successful.get('time') else None,
+                    'items_processed': last_successful.get('items_processed', 0),
+                    'duration_ms': last_successful.get('duration_ms', 0)
+                },
+                'next_run': next_run.isoformat() + 'Z' if next_run else None
+            }
+            
+            cron_jobs.append(cron_job)
         
         return jsonify({'cron_jobs': cron_jobs})
         

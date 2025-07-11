@@ -9,8 +9,18 @@
     <div class="col-12">
         <div class="card">
             <div class="card-header">
-                <h5 class="card-title">Scheduled Jobs</h5>
-                <small class="text-muted">Monitor the status of all scheduled background jobs</small>
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h5 class="card-title mb-0">Scheduled Jobs</h5>
+                        <small class="text-muted">Monitor the status of all scheduled background jobs</small>
+                    </div>
+                    <div class="text-end">
+                        <small class="text-muted">Server Time (UTC)</small><br>
+                        <strong id="server-time">Loading...</strong><br>
+                        <small class="text-muted">Local Time</small><br>
+                        <strong id="local-time">Loading...</strong>
+                    </div>
+                </div>
             </div>
             <div class="card-body">
                 <div class="table-responsive">
@@ -158,26 +168,68 @@ async function loadCronJobs() {
         data.cron_jobs.forEach(job => {
             const row = document.createElement('tr');
             
-            const statusBadge = job.status === 'active' ? 
-                '<span class="badge bg-success"><i class="fas fa-check-circle"></i> Active</span>' : 
-                '<span class="badge bg-danger"><i class="fas fa-times-circle"></i> Inactive</span>';
+            let statusBadge;
+            switch(job.status) {
+                case 'healthy':
+                    statusBadge = '<span class="badge bg-success"><i class="fas fa-check-circle"></i> Healthy</span>';
+                    break;
+                case 'warning':
+                    statusBadge = '<span class="badge bg-warning"><i class="fas fa-exclamation-triangle"></i> Warning</span>';
+                    break;
+                case 'unhealthy':
+                    statusBadge = '<span class="badge bg-danger"><i class="fas fa-times-circle"></i> Unhealthy</span>';
+                    break;
+                case 'never_run':
+                    statusBadge = '<span class="badge bg-secondary"><i class="fas fa-question-circle"></i> Never Run</span>';
+                    break;
+                default:
+                    statusBadge = '<span class="badge bg-secondary"><i class="fas fa-question-circle"></i> Unknown</span>';
+            }
             
-            const lastRun = job.last_run ? new Date(job.last_run).toLocaleString() : 'Never';
+            // Parse dates assuming they're in UTC if not specified
+            const lastRun = job.last_execution ? new Date(job.last_execution + (job.last_execution.includes('Z') || job.last_execution.includes('+') ? '' : 'Z')).toLocaleString() : 'Never';
             const nextRun = job.next_run ? new Date(job.next_run).toLocaleString() : 'Unknown';
             
-            // Calculate time until next run (handle timezone properly)
-            let nextRunDisplay = nextRun;
+            // Calculate time until next run
+            let nextRunDisplay = 'Unknown';
             if (job.next_run) {
-                const now = new Date();
-                const nextRunTime = new Date(job.next_run + 'Z'); // Ensure UTC interpretation
-                const diff = nextRunTime - now;
+                // Parse the next run time as UTC
+                const nextRunStr = job.next_run + (job.next_run.includes('Z') || job.next_run.includes('+') ? '' : 'Z');
+                const nextRunTime = new Date(nextRunStr);
                 
-                if (diff > 0) {
-                    const hours = Math.floor(diff / (1000 * 60 * 60));
-                    const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-                    nextRunDisplay = `${new Date(job.next_run + 'Z').toLocaleString()}<br><small class="text-muted">in ${hours}h ${minutes}m</small>`;
-                } else {
-                    nextRunDisplay = `${new Date(job.next_run + 'Z').toLocaleString()}<br><small class="text-warning">Overdue</small>`;
+                if (!isNaN(nextRunTime.getTime())) {
+                    // Display in local time
+                    nextRunDisplay = nextRunTime.toLocaleString();
+                    
+                    // Calculate difference from current time
+                    const now = new Date();
+                    const diff = nextRunTime.getTime() - now.getTime();
+                    
+                    if (diff > 0) {
+                        // Future - show time until
+                        const hours = Math.floor(diff / (1000 * 60 * 60));
+                        const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+                        const seconds = Math.floor((diff % (1000 * 60)) / 1000);
+                        if (hours > 0) {
+                            nextRunDisplay += `<br><small class="text-muted">in ${hours}h ${minutes}m</small>`;
+                        } else if (minutes > 0) {
+                            nextRunDisplay += `<br><small class="text-muted">in ${minutes}m ${seconds}s</small>`;
+                        } else {
+                            nextRunDisplay += `<br><small class="text-muted">in ${seconds}s</small>`;
+                        }
+                    } else {
+                        // Past - show overdue
+                        const overdueMs = Math.abs(diff);
+                        const hours = Math.floor(overdueMs / (1000 * 60 * 60));
+                        const minutes = Math.floor((overdueMs % (1000 * 60 * 60)) / (1000 * 60));
+                        if (hours > 0) {
+                            nextRunDisplay += `<br><small class="text-warning">Overdue by ${hours}h ${minutes}m</small>`;
+                        } else if (minutes > 0) {
+                            nextRunDisplay += `<br><small class="text-warning">Overdue by ${minutes}m</small>`;
+                        } else {
+                            nextRunDisplay += `<br><small class="text-warning">Overdue</small>`;
+                        }
+                    }
                 }
             }
             
@@ -211,10 +263,24 @@ function startAutoRefresh() {
     setInterval(loadCronJobs, 30000);
 }
 
+// Update time display
+function updateTimeDisplay() {
+    const now = new Date();
+    
+    // Format local time
+    document.getElementById('local-time').textContent = now.toLocaleString();
+    
+    // Format UTC time properly
+    const utcString = now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+    document.getElementById('server-time').textContent = utcString;
+}
+
 // Load cron jobs on page load
 document.addEventListener('DOMContentLoaded', () => {
     loadCronJobs();
     startAutoRefresh();
+    updateTimeDisplay();
+    setInterval(updateTimeDisplay, 1000); // Update time every second
 });
 </script>
 {% endblock %}

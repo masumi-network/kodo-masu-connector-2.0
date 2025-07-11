@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Dict, Any, List, Optional, Union
 from enum import Enum
 
@@ -32,16 +32,11 @@ class StartJobResponse(BaseModel):
     amounts: List[Amount] = Field(..., description="Payment amounts")
     input_hash: str = Field(..., description="Hash of the input data submitted")
 
-class ValidationRule(BaseModel):
-    validation: str = Field(..., description="Type of validation")
-    value: str = Field(..., description="Validation value")
-
 class InputField(BaseModel):
     id: str = Field(..., description="Unique identifier for the input field")
     type: str = Field(..., description="Type of the expected input")
     name: Optional[str] = Field(None, description="Displayed name for the input field")
     data: Optional[Dict[str, Any]] = Field(None, description="Additional data for the field")
-    validations: Optional[List[ValidationRule]] = Field(None, description="Validation rules")
 
 class StatusResponse(BaseModel):
     job_id: str = Field(..., description="Job ID")

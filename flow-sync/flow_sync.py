@@ -8,6 +8,8 @@ import psycopg2
 from datetime import datetime
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, Any
+import asyncio
+from cron_logger import CronExecutionLogger
 
 # Import MIP003 converter
 from mip003_converter import convert_kodosumi_to_mip003
@@ -195,50 +197,76 @@ def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
         print(f"Error upserting flow {flow_data.get('uid', 'unknown')}: {str(e)}")
         return False
 
+async def sync_flows_with_logging():
+    """Main function to sync flows from Kodosumi API to database with execution logging."""
+    # Build database URL for cron logger
+    database_url = f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@{os.getenv('POSTGRES_HOST', 'postgres')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB')}"
+    
+    cron_logger = CronExecutionLogger('flow-sync', database_url)
+    await cron_logger.log_start()
+    
+    items_processed = 0
+    error = None
+    
+    try:
+        print(f"\n--- Starting flow sync at {datetime.now()} ---")
+        
+        # Get the latest API key
+        api_key = get_latest_api_key()
+        if not api_key:
+            print("No API key available. Skipping flow sync.")
+            return False
+        
+        # Fetch all flows
+        flows = fetch_flows(api_key)
+        if not flows:
+            print("No flows retrieved. Skipping sync.")
+            return False
+        
+        # Process each flow
+        success_count = 0
+        error_count = 0
+        
+        for flow in flows:
+            flow_uid = flow.get('uid', 'unknown')
+            flow_url = flow.get('url')
+            
+            print(f"\nProcessing flow: {flow.get('summary', 'Unknown')} (UID: {flow_uid})")
+            
+            # Fetch input schema for this flow
+            input_schema = None
+            if flow_url:
+                input_schema = fetch_flow_input_schema(api_key, flow_url)
+            
+            # Upsert the flow to database
+            if upsert_flow(flow, input_schema):
+                success_count += 1
+                print(f"✓ Successfully synced flow: {flow_uid}")
+            else:
+                error_count += 1
+                print(f"✗ Failed to sync flow: {flow_uid}")
+        
+        items_processed = success_count
+        if error_count > 0:
+            error = f"Failed to sync {error_count} flows"
+        
+        print(f"\n--- Flow sync completed at {datetime.now()} ---")
+        print(f"Successfully synced: {success_count} flows")
+        print(f"Errors: {error_count} flows")
+        
+        return error_count == 0
+        
+    except Exception as e:
+        error = str(e)
+        print(f"Error in flow sync: {error}")
+        return False
+        
+    finally:
+        await cron_logger.log_completion(items_processed, error)
+
 def sync_flows():
-    """Main function to sync flows from Kodosumi API to database."""
-    print(f"\n--- Starting flow sync at {datetime.now()} ---")
-    
-    # Get the latest API key
-    api_key = get_latest_api_key()
-    if not api_key:
-        print("No API key available. Skipping flow sync.")
-        return False
-    
-    # Fetch all flows
-    flows = fetch_flows(api_key)
-    if not flows:
-        print("No flows retrieved. Skipping sync.")
-        return False
-    
-    # Process each flow
-    success_count = 0
-    error_count = 0
-    
-    for flow in flows:
-        flow_uid = flow.get('uid', 'unknown')
-        flow_url = flow.get('url')
-        
-        print(f"\nProcessing flow: {flow.get('summary', 'Unknown')} (UID: {flow_uid})")
-        
-        # Fetch input schema for this flow
-        input_schema = None
-        if flow_url:
-            input_schema = fetch_flow_input_schema(api_key, flow_url)
-        
-        # Upsert the flow to database
-        if upsert_flow(flow, input_schema):
-            success_count += 1
-            print(f"✓ Successfully synced flow: {flow_uid}")
-        else:
-            error_count += 1
-            print(f"✗ Failed to sync flow: {flow_uid}")
-    
-    print(f"\n--- Flow sync completed at {datetime.now()} ---")
-    print(f"Successfully synced: {success_count} flows")
-    print(f"Errors: {error_count} flows")
-    
-    return error_count == 0
+    """Wrapper to run async function."""
+    return asyncio.run(sync_flows_with_logging())
 
 def wait_for_database():
     """Wait for the database to be ready."""

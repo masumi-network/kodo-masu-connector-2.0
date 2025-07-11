@@ -6,6 +6,7 @@ This microservice runs every 2 minutes and:
 1. Checks for jobs that are running in Kodosumi (have a kodosumi_fid)
 2. Queries Kodosumi for their status
 3. Updates the job when it's completed with the final result
+4. Submits results to Masumi for payment completion
 """
 import asyncio
 import asyncpg
@@ -13,8 +14,10 @@ import httpx
 import logging
 import os
 import json
+import sys
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
+from database_payment_service import DatabasePaymentService
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +28,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Payment service is now available through database configuration
+PAYMENT_SERVICE_AVAILABLE = True
 
 class KodosumiStatusChecker:
     """Service for checking status of jobs in Kodosumi."""
@@ -67,8 +73,9 @@ class KodosumiStatusChecker:
         query = """
             SELECT j.job_id, j.flow_uid, j.status, 
                    j.result->>'kodosumi_fid' as kodosumi_fid,
+                   j.payment_data, j.input_data, j.identifier_from_purchaser,
                    j.created_at, j.updated_at,
-                   f.summary as flow_summary
+                   f.summary as flow_summary, f.agent_identifier
             FROM jobs j
             LEFT JOIN flows f ON j.flow_uid = f.uid
             WHERE j.status = 'running' 
@@ -80,12 +87,20 @@ class KodosumiStatusChecker:
         jobs = []
         
         for row in rows:
+            # Parse JSON fields
+            payment_data = json.loads(row['payment_data']) if row['payment_data'] else {}
+            input_data = json.loads(row['input_data']) if row['input_data'] else {}
+            
             jobs.append({
                 'job_id': row['job_id'],
                 'flow_uid': row['flow_uid'],
                 'status': row['status'],
                 'kodosumi_fid': row['kodosumi_fid'],
                 'flow_summary': row['flow_summary'],
+                'payment_data': payment_data,
+                'input_data': input_data,
+                'identifier_from_purchaser': row['identifier_from_purchaser'],
+                'agent_identifier': row['agent_identifier'],
                 'created_at': row['created_at'],
                 'updated_at': row['updated_at']
             })
@@ -165,20 +180,54 @@ class KodosumiStatusChecker:
             logger.error(f"Failed to update completed job {job_id}: {e}")
             return False
     
+    def extract_blockchain_identifier(self, payment_data: Dict[str, Any]) -> Optional[str]:
+        """Extract blockchain identifier from payment data."""
+        # Check nested structure first (new format)
+        if 'data' in payment_data and isinstance(payment_data['data'], dict):
+            return payment_data['data'].get('blockchainIdentifier')
+        
+        # Fallback to direct access (old format)
+        return payment_data.get('blockchainIdentifier')
+    
+    async def submit_result_to_masumi(self, job: Dict[str, Any], final_result: str, api_key: str):
+        """Submit job result to Masumi for payment completion."""
+        try:
+            # Use the database-based payment service
+            completion_response = await DatabasePaymentService.complete_payment(
+                job=job,
+                final_result=final_result,
+                api_key=api_key
+            )
+            
+            if completion_response:
+                logger.info(f"Successfully submitted result to Masumi for job {job['job_id']}")
+            
+        except Exception as e:
+            # Don't fail the job update if payment completion fails
+            logger.error(f"Failed to submit result to Masumi for job {job['job_id']}: {e}")
+            logger.error(f"This means the agent may not receive payment for this completed job!")
+    
     async def process_jobs(self):
         """Main process to check status of jobs in Kodosumi."""
+        jobs_processed = 0  # Track for cron execution logging
         try:
             # Connect to database
             conn = await asyncpg.connect(self.database_url)
             
-            # Get latest API key
-            api_key = await self.get_latest_api_key(conn)
-            if not api_key:
+            # Get latest Kodosumi API key for status checking
+            kodosumi_api_key = await self.get_latest_api_key(conn)
+            if not kodosumi_api_key:
                 logger.warning("No API key found in database. Cannot check job status.")
                 await conn.close()
                 return
             
-            logger.info(f"Using API key: {api_key[:20]}...")
+            logger.info(f"Using Kodosumi API key: {kodosumi_api_key[:20]}...")
+            
+            # Get Masumi payment API key from environment
+            payment_api_key = os.getenv('PAYMENT_API_KEY')
+            if not payment_api_key:
+                logger.warning("No PAYMENT_API_KEY in environment. Payment completion will be skipped.")
+                payment_api_key = None
             
             # Get jobs that need status checking
             running_jobs = await self.get_running_jobs_with_fid(conn)
@@ -192,13 +241,14 @@ class KodosumiStatusChecker:
             
             # Check status for each job
             for job in running_jobs:
+                jobs_processed += 1  # Count each job checked
                 job_id = str(job['job_id'])
                 fid = job['kodosumi_fid']
                 
                 logger.info(f"Checking status for job {job_id} (FID: {fid})")
                 
                 # Check job status in Kodosumi
-                status_result = await self.check_job_status(fid, api_key)
+                status_result = await self.check_job_status(fid, kodosumi_api_key)
                 
                 if status_result:
                     status = status_result.get('status', 'unknown')
@@ -211,6 +261,12 @@ class KodosumiStatusChecker:
                             success = await self.update_completed_job(conn, job_id, final_result)
                             if success:
                                 logger.info(f"Successfully updated completed job {job_id}")
+                                
+                                # Submit result to Masumi for payment completion
+                                if PAYMENT_SERVICE_AVAILABLE and payment_api_key:
+                                    await self.submit_result_to_masumi(job, final_result, payment_api_key)
+                                else:
+                                    logger.warning(f"Payment service not available or no payment API key - skipping payment completion for job {job_id}")
                             else:
                                 logger.error(f"Failed to update completed job {job_id}")
                         else:
@@ -234,6 +290,7 @@ class KodosumiStatusChecker:
             
             await conn.close()
             logger.info("Kodosumi status checking completed successfully")
+            return jobs_processed  # Return count for cron logging
             
         except Exception as e:
             logger.error(f"Error in Kodosumi status checking: {e}")
