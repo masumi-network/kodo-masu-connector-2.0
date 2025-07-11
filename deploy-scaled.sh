@@ -56,7 +56,7 @@ sleep 10
 
 # Apply migrations
 echo "Applying database migrations..."
-docker compose -f docker-compose.yml -f docker-compose.scale.yml run --rm api-server bash /app/scripts/apply_migrations.sh
+./scripts/apply_migrations.sh
 
 # Start all services with scaling
 echo "Starting all services with 3 API instances..."
