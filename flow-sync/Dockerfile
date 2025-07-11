@@ -19,17 +19,21 @@ COPY flow-sync/cron_logger.py .
 # Make the script executable
 RUN chmod +x flow_sync.py
 
-# Create cron job to run every 30 minutes
-RUN echo "*/30 * * * * cd /app && python3 flow_sync.py >> /var/log/flow-sync.log 2>&1" > /etc/cron.d/kodosumi-flow-sync
+# Copy crontab file
+COPY flow-sync/crontab /etc/cron.d/flow-sync
 
 # Give execution rights on the cron job
-RUN chmod 0644 /etc/cron.d/kodosumi-flow-sync
+RUN chmod 0644 /etc/cron.d/flow-sync
 
 # Apply cron job
-RUN crontab /etc/cron.d/kodosumi-flow-sync
+RUN crontab /etc/cron.d/flow-sync
 
 # Create the log file to be able to run tail
 RUN touch /var/log/flow-sync.log
 
-# Run initial flow sync then start cron
-CMD python3 flow_sync.py && cron && tail -f /var/log/flow-sync.log
+# Copy entrypoint script
+COPY flow-sync/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Run the entrypoint script
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,2 @@
+# Run the flow sync every 30 minutes
+*/30 * * * * . /etc/environment && cd /app && /usr/local/bin/python /app/flow_sync.py >> /var/log/flow-sync.log 2>&1
