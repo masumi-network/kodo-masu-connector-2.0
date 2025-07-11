@@ -18,17 +18,21 @@ COPY authenticator/cron_logger.py .
 # Make the script executable
 RUN chmod +x authenticator.py
 
-# Create cron job to run every 10 hours
-RUN echo "0 */10 * * * cd /app && python3 authenticator.py >> /var/log/cron.log 2>&1" > /etc/cron.d/kodosumi-auth
+# Copy crontab file
+COPY authenticator/crontab /etc/cron.d/authenticator
 
 # Give execution rights on the cron job
-RUN chmod 0644 /etc/cron.d/kodosumi-auth
+RUN chmod 0644 /etc/cron.d/authenticator
 
 # Apply cron job
-RUN crontab /etc/cron.d/kodosumi-auth
+RUN crontab /etc/cron.d/authenticator
 
 # Create the log file to be able to run tail
 RUN touch /var/log/cron.log
 
-# Run initial authentication then start cron
-CMD python3 authenticator.py && cron && tail -f /var/log/cron.log
+# Copy entrypoint script
+COPY authenticator/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Run the entrypoint script
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,2 @@
+# Run the authenticator every 10 hours
+0 */10 * * * . /etc/environment && cd /app && /usr/local/bin/python /app/authenticator.py >> /var/log/cron.log 2>&1
