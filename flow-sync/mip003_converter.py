@@ -75,24 +75,19 @@ class MIP003Converter:
         if not element_name or element_type not in self.type_mapping:
             return None
         
-        # Base MIP003 structure
+        # Base MIP003 structure - don't include validations by default
         mip003_element = {
             'id': element_name,
             'type': self.type_mapping[element_type],
             'name': element.get('label', element_name),
-            'data': {},
-            'validations': []
+            'data': {}
         }
         
         # Add data fields
         self._add_data_fields(element, mip003_element)
         
-        # Add validations
+        # Add validations - this will only add the field if there are validations
         self._add_validations(element, mip003_element)
-        
-        # Remove validations key if empty
-        if not mip003_element['validations']:
-            del mip003_element['validations']
         
         return mip003_element
     
@@ -110,17 +105,19 @@ class MIP003Converter:
         if element.get('placeholder'):
             data['placeholder'] = element['placeholder']
         
-        # Add description from label or placeholder
-        if element.get('label'):
-            data['description'] = element['label']
-        
         # Handle select options
         if element.get('type') == 'select' and element.get('option'):
             values = []
             for option in element['option']:
-                if isinstance(option, dict) and option.get('label'):
-                    values.append(option['label'])
+                if isinstance(option, dict):
+                    # For Kodosumi InputOption objects:
+                    # - 'name' contains the actual option value
+                    # - 'label' contains the display text
+                    # - 'value' is a boolean indicating if selected
+                    if option.get('name') is not None:
+                        values.append(option['name'])
                 elif isinstance(option, str):
+                    # For string options, use as-is
                     values.append(option)
             
             if values:
@@ -128,22 +125,25 @@ class MIP003Converter:
         
         # Handle checkbox options
         elif element.get('type') == 'checkbox' and element.get('option'):
-            data['description'] = element.get('option', element.get('label', ''))
+            # For checkboxes, the option text can serve as placeholder
+            data['placeholder'] = element.get('option', '')
     
     def _add_validations(self, element: Dict[str, Any], mip003_element: Dict[str, Any]):
         """
         Add validation rules to MIP003 element based on Kodosumi element.
+        Only adds the validations field if there are actual validations.
         
         Args:
             element: Original Kodosumi element
             mip003_element: MIP003 element being constructed
         """
-        validations = mip003_element['validations']
+        validations = []
         element_type = element.get('type', '')
         
         # MIP003 spec: all fields are required by default
         # Only add optional validation if field is NOT required
-        if not element.get('required', False):
+        # EXCEPTION: Select fields are always required (override Kodosumi setting)
+        if not element.get('required', False) and element_type != 'select':
             validations.append({
                 'validation': 'optional',
                 'value': 'true'
@@ -165,6 +165,10 @@ class MIP003Converter:
         # Select validations
         elif element_type == 'select':
             self._add_select_validations(element, validations)
+        
+        # Only add validations field if there are actual validations
+        if validations:
+            mip003_element['validations'] = validations
     
     def _add_string_validations(self, element: Dict[str, Any], validations: List[Dict[str, Any]]):
         """Add string-specific validations."""
@@ -252,9 +256,11 @@ class MIP003Converter:
     def _add_select_validations(self, element: Dict[str, Any], validations: List[Dict[str, Any]]):
         """Add select-specific validations."""
         
-        # For single select, add min=1 and max=1
-        # For multi-select, this would need to be determined from context
-        # Default to single select for now
+        # Treat all select fields as single-select since Kodosumi doesn't distinguish
+        # between single and multi-select. This ensures consistent behavior where
+        # select fields only accept a single value.
+        
+        # All select fields are forced to be required, so always add min=1 and max=1
         validations.append({
             'validation': 'min',
             'value': '1'

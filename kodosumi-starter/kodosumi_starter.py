@@ -100,7 +100,63 @@ class KodosumiStarter:
         
         return jobs
     
-    async def start_job_in_kodosumi(self, job: Dict[str, Any], api_key: str) -> Optional[str]:
+    async def convert_indices_to_values(self, input_data: Dict[str, Any], mip003_schema: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Convert multi-select indices back to their string values using the MIP003 schema."""
+        logger.info(f"convert_indices_to_values called with: {input_data}")
+        converted_data = input_data.copy()
+        
+        # Create a map of field IDs to their schemas
+        field_map = {field['id']: field for field in mip003_schema}
+        
+        for field_id, value in input_data.items():
+            if field_id in field_map and isinstance(value, list):
+                field = field_map[field_id]
+                # Check if this is an option field (multi-select)
+                if field.get('type') == 'option':
+                    logger.info(f"Processing option field {field_id} with value {value}")
+                    values_list = field.get('data', {}).get('values', [])
+                    if values_list:
+                        # Convert indices to actual values
+                        try:
+                            converted_values = []
+                            for idx in value:
+                                if isinstance(idx, int) and 0 <= idx < len(values_list):
+                                    converted_values.append(values_list[idx])
+                                else:
+                                    # If not a valid index, keep original value
+                                    converted_values.append(idx)
+                            # Kodosumi expects select fields as strings, not arrays
+                            # For multi-select, we'll take the first value
+                            if converted_values:
+                                converted_data[field_id] = converted_values[0]
+                                if len(converted_values) > 1:
+                                    logger.warning(f"Field {field_id} has multiple values {converted_values}, using first: '{converted_values[0]}'")
+                                else:
+                                    logger.info(f"Converted {field_id}: {value} -> '{converted_values[0]}'")
+                        except Exception as e:
+                            logger.warning(f"Failed to convert indices for {field_id}: {e}")
+        
+        return converted_data
+
+    async def get_flow_schema(self, conn: asyncpg.Connection, flow_uid: str) -> Optional[List[Dict[str, Any]]]:
+        """Get the MIP003 schema for a flow."""
+        try:
+            query = """
+                SELECT mip003_schema 
+                FROM flows 
+                WHERE uid = $1
+            """
+            
+            row = await conn.fetchrow(query, flow_uid)
+            if row and row['mip003_schema']:
+                schema = json.loads(row['mip003_schema']) if isinstance(row['mip003_schema'], str) else row['mip003_schema']
+                return schema
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get schema for flow {flow_uid}: {e}")
+            return None
+
+    async def start_job_in_kodosumi(self, job: Dict[str, Any], api_key: str, conn: asyncpg.Connection) -> Optional[str]:
         """Start a job in Kodosumi and return the flow identifier (fid)."""
         try:
             # Use the flow URL from the database if available
@@ -124,6 +180,42 @@ class KodosumiStarter:
                 logger.warning(f"Input data is a string, parsing as JSON: {payload}")
                 payload = json.loads(payload)
             
+            # Get the flow schema and convert indices to values
+            schema = await self.get_flow_schema(conn, job['flow_uid'])
+            logger.info(f"Retrieved schema for flow {job['flow_uid']}: {bool(schema)}")
+            if schema:
+                # Log before conversion
+                logger.info(f"Payload before conversion: {payload}")
+                payload = await self.convert_indices_to_values(payload, schema)
+                logger.info(f"Payload after conversion: {payload}")
+                
+                # Add empty strings for missing optional fields to handle Kodosumi's .strip() calls
+                for field in schema:
+                    field_id = field.get('id')
+                    if field_id and field_id not in payload:
+                        # Check if field is optional
+                        validations = field.get('validations', [])
+                        is_optional = any(
+                            v.get('validation') == 'optional' and v.get('value') == 'true' 
+                            for v in validations
+                        )
+                        if is_optional:
+                            # Add empty string for optional string fields
+                            if field.get('type') == 'string':
+                                payload[field_id] = ""
+                                logger.info(f"Added empty string for optional field: {field_id}")
+            else:
+                logger.warning(f"No schema found for flow {job['flow_uid']}, using payload as-is")
+            
+            # Special handling for model_family field - Kodosumi expects a string, not array
+            if 'model_family' in payload and isinstance(payload['model_family'], list):
+                if payload['model_family']:
+                    payload['model_family'] = payload['model_family'][0]
+                    logger.info(f"Converted model_family from list to string: {payload['model_family']}")
+                else:
+                    payload['model_family'] = ""
+                    logger.info("Converted empty model_family list to empty string")
+            
             logger.info(f"Sending payload: {payload}")
             
             # Make the request to Kodosumi using the API key
@@ -134,6 +226,15 @@ class KodosumiStarter:
                 }
                 
                 # Log the full request details for debugging
+                # Last-resort fix for model_family field
+                logger.info(f"Checking model_family before fix: {payload.get('model_family')} (type: {type(payload.get('model_family'))})")
+                if 'model_family' in payload and isinstance(payload['model_family'], list):
+                    logger.info(f"model_family is a list with {len(payload['model_family'])} items")
+                    if payload['model_family']:
+                        # If it's still a list of strings, take the first one
+                        payload['model_family'] = str(payload['model_family'][0])
+                        logger.warning(f"Last-resort conversion: model_family converted to string: {payload['model_family']}")
+                
                 logger.info(f"Request headers: {headers}")
                 logger.info(f"Request payload type: {type(payload)}")
                 logger.info(f"Request payload: {json.dumps(payload)}")
@@ -290,7 +391,7 @@ class KodosumiStarter:
                 logger.info(f"Processing job {job_id} for flow: {job['flow_summary']} (attempt {attempts + 1}/5)")
                 
                 # Start job in Kodosumi
-                fid = await self.start_job_in_kodosumi(job, api_key)
+                fid = await self.start_job_in_kodosumi(job, api_key, conn)
                 
                 if fid:
                     # Update job with the Kodosumi flow identifier

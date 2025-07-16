@@ -16,7 +16,7 @@ class Amount(BaseModel):
 
 class StartJobRequest(BaseModel):
     identifier_from_purchaser: str = Field(..., description="Purchaser-defined identifier")
-    input_data: Dict[str, Union[str, int, float, bool, None]] = Field(..., description="Input data for the job")
+    input_data: Dict[str, Union[str, int, float, bool, List[str], List[int], None]] = Field(..., description="Input data for the job")
 
 class StartJobResponse(BaseModel):
     status: str = Field(..., description="Status of job request")
@@ -37,6 +37,7 @@ class InputField(BaseModel):
     type: str = Field(..., description="Type of the expected input")
     name: Optional[str] = Field(None, description="Displayed name for the input field")
     data: Optional[Dict[str, Any]] = Field(None, description="Additional data for the field")
+    validations: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="Validation rules for the field")
 
 class StatusResponse(BaseModel):
     job_id: str = Field(..., description="Job ID")
@@ -48,7 +49,7 @@ class StatusResponse(BaseModel):
 
 class ProvideInputRequest(BaseModel):
     job_id: str = Field(..., description="Job ID awaiting input")
-    input_data: Dict[str, Union[str, int, float, bool, None]] = Field(..., description="Additional input data")
+    input_data: Dict[str, Union[str, int, float, bool, List[str], List[int], None]] = Field(..., description="Additional input data")
 
 class ProvideInputResponse(BaseModel):
     status: str = Field(..., description="Status of the input provision")

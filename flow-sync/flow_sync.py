@@ -171,6 +171,7 @@ def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
                 updated_at = CURRENT_TIMESTAMP
         """
         
+        
         # Execute the upsert
         cursor.execute(upsert_query, (
             flow_data.get('uid'),

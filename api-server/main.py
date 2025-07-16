@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi import FastAPI, HTTPException, Path, Query, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
@@ -146,7 +147,15 @@ async def start_job(
             import json
             mip003_schema = json.loads(mip003_schema)
         
-        # TODO: Add input validation against schema
+        # Validate input data against schema
+        from validators import validate_input_data, ValidationError
+        try:
+            validate_input_data(job_request.input_data, mip003_schema)
+        except ValidationError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid input data: {e.message}"
+            )
         
         # Get agent identifier from flow
         flow_agent_identifier = flow.get('agent_identifier')
@@ -190,15 +199,20 @@ async def start_job(
         # Extract amounts from RequestedFunds
         requested_funds = payment_data.get("RequestedFunds", [])
         amounts_list = []
+        
         for fund in requested_funds:
-            # Convert from lovelace to ada if unit contains lovelace/ADA info
-            unit = fund.get("unit", "")
             amount = int(fund.get("amount", 0))
             
-            # Hardcode the unit to the specific hex string
-            # This is the unit identifier for USDM token
-            hardcoded_unit = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d"
-            amounts_list.append(Amount(amount=amount, unit=hardcoded_unit))
+            # Use different units based on network
+            if config.NETWORK.lower() == "preprod":
+                # Preprod uses empty string for lovelace/ADA
+                unit = ""
+            else:
+                # Mainnet uses USDM token identifier
+                unit = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d"
+            
+            logger.info(f"Network: {config.NETWORK}, Unit: '{unit}'")
+            amounts_list.append(Amount(amount=amount, unit=unit))
         
         # Store job in database (use the actual UID from the flow)
         # Store the complete payment response for future reference
@@ -222,6 +236,9 @@ async def start_job(
         
         # Build response - ensure job_id is a string
         job_id_string = str(created_job_id)
+        
+        # Log the amounts before creating response
+        logger.info(f"Amounts list: {[{'amount': a.amount, 'unit': a.unit} for a in amounts_list]}")
         
         response = StartJobResponse(
             status="success",
@@ -295,42 +312,73 @@ async def check_job_status(
             raise HTTPException(status_code=404, detail="Job not found for this flow")
         
         # Build status response
-        # Only include result if job is completed
-        result = None
-        if job["status"] == "completed":
-            result = job.get("result")
-            if result and isinstance(result, dict):
-                # Check if this is a kodosumi result with final_result structure
-                if "final_result" in result and isinstance(result["final_result"], dict):
-                    # Extract the body content from nested structure
-                    final_result = result["final_result"]
-                    if "Markdown" in final_result and isinstance(final_result["Markdown"], dict):
-                        # Return just the body content
-                        result = final_result["Markdown"].get("body", "")
+        # Check if this is a job that failed to start in Kodosumi
+        # Jobs with status "error" and waiting_for_start_in_kodosumi=true failed to start
+        if (job["status"] == "error" and 
+            job.get("waiting_for_start_in_kodosumi", False) and 
+            job.get("kodosumi_start_attempts", 0) >= 5):
+            # This job failed to start in Kodosumi after max attempts
+            response = StatusResponse(
+                job_id=job_id,
+                status="failed",  # Return "failed" per MIP003 spec
+                message="Failed to start agent job",
+                result=None,
+                reasoning=None
+            )
+        else:
+            # Map database status to API status
+            db_status = job["status"]
+            # Convert "error" status to "failed" for API response
+            if db_status == "error":
+                api_status = "failed"
+            else:
+                api_status = db_status
+            
+            # Debug logging
+            logger.info(f"Status mapping: db_status={db_status}, api_status={api_status}")
+            
+            # Only include result if job is completed
+            result = None
+            if db_status == "completed":
+                result = job.get("result")
+                if result and isinstance(result, dict):
+                    # Check if this is a kodosumi result with final_result structure
+                    if "final_result" in result and isinstance(result["final_result"], dict):
+                        # Extract the body content from nested structure
+                        final_result = result["final_result"]
+                        if "Markdown" in final_result and isinstance(final_result["Markdown"], dict):
+                            # Return just the body content
+                            result = final_result["Markdown"].get("body", "")
+                        else:
+                            # If not in expected format, return the whole final_result as JSON
+                            import json
+                            result = json.dumps(final_result)
                     else:
-                        # If not in expected format, return the whole final_result as JSON
+                        # For other dict results, convert to JSON string
                         import json
-                        result = json.dumps(final_result)
-                else:
-                    # For other dict results, convert to JSON string
-                    import json
-                    result = json.dumps(result)
-        
-        response = StatusResponse(
-            job_id=job_id,
-            status=job["status"],
-            message=job.get("message"),
-            result=result,  # Will be None unless job is completed
-            reasoning=job.get("reasoning") if job["status"] == "completed" else None
-        )
+                        result = json.dumps(result)
+            
+            try:
+                response = StatusResponse(
+                    job_id=job_id,
+                    status=api_status,  # This should work with string value
+                    message=job.get("message"),
+                    result=result,  # Will be None unless job is completed
+                    reasoning=job.get("reasoning") if db_status == "completed" else None
+                )
+            except Exception as e:
+                logger.error(f"Error creating StatusResponse: {e}")
+                logger.error(f"api_status type: {type(api_status)}, value: {api_status}")
+                logger.error(f"db_status: {db_status}")
+                raise
         
         # Add input_data if status is awaiting_input
         if job["status"] == "awaiting_input":
             # TODO: Add logic to determine required input fields
             response.input_data = []
         
-        # Cache response if job is completed (won't change anymore)
-        if job["status"] in ["completed", "failed"]:
+        # Cache response if job is completed or failed (won't change anymore)
+        if response.status in ["completed", "failed"]:
             await response_cache.set("status", {"key": cache_key}, response)
         
         return response
@@ -413,7 +461,20 @@ async def get_input_schema(
         # Check cache first (use schema_cache with longer TTL)
         cached_response = await schema_cache.get("input_schema", {"flow_identifier": flow_identifier})
         if cached_response:
-            return cached_response
+            # Create a deep copy to avoid modifying cached data
+            import copy
+            response_copy = copy.deepcopy(cached_response)
+            # Ensure validations is always an array
+            if 'input_data' in response_copy:
+                for field in response_copy['input_data']:
+                    if 'validations' in field and field['validations'] is None:
+                        field['validations'] = []
+                    elif 'validations' not in field:
+                        field['validations'] = []
+            # Use Response with manual JSON to ensure arrays stay as arrays
+            import json
+            json_str = json.dumps(response_copy)
+            return Response(content=json_str, media_type="application/json")
         
         # Get flow from database (by UID or name)
         flow = await db_manager.get_flow_by_uid_or_name(flow_identifier)
@@ -433,12 +494,29 @@ async def get_input_schema(
             import json
             mip003_schema = json.loads(mip003_schema)
         
-        response = InputSchemaResponse(input_data=mip003_schema)
+        # Clean up the schema to ensure validations is always an array
+        cleaned_schema = []
+        for field in mip003_schema:
+            cleaned_field = dict(field)  # Create a copy
+            # Convert None validations to empty array
+            if 'validations' in cleaned_field and cleaned_field['validations'] is None:
+                cleaned_field['validations'] = []
+            # Ensure validations field exists as empty array if not present
+            elif 'validations' not in cleaned_field:
+                cleaned_field['validations'] = []
+            cleaned_schema.append(cleaned_field)
+        
+        response_data = {"input_data": cleaned_schema}
         
         # Cache the response for 10 minutes (schemas rarely change)
-        await schema_cache.set("input_schema", {"flow_identifier": flow_identifier}, response)
+        await schema_cache.set("input_schema", {"flow_identifier": flow_identifier}, response_data)
         
-        return response
+        # Use Response with manual JSON to ensure arrays stay as arrays
+        import json
+        json_str = json.dumps(response_data)
+        # Debug: log what we're returning
+        logger.info(f"DEBUG: Returning JSON: {json_str[:200]}")
+        return Response(content=json_str, media_type="application/json")
         
     except HTTPException:
         raise

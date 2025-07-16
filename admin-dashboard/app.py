@@ -1,15 +1,35 @@
 #!/usr/bin/env python3
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, redirect, url_for, flash
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 import psycopg2
 import json
 import os
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+import secrets
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
+app.secret_key = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
+
+# Initialize Flask-Login
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Please log in to access the admin dashboard.'
+
+# Simple user class for authentication
+class AdminUser(UserMixin):
+    def __init__(self, id):
+        self.id = id
+
+@login_manager.user_loader
+def load_user(user_id):
+    if user_id == 'admin':
+        return AdminUser('admin')
+    return None
 
 # Database configuration
 DB_CONFIG = {
@@ -24,27 +44,60 @@ def get_db_connection():
     """Create and return a database connection."""
     return psycopg2.connect(**DB_CONFIG)
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Login page."""
+    if request.method == 'POST':
+        password = request.form.get('password')
+        admin_password = os.getenv('ADMIN_PASSWORD')
+        
+        if not admin_password:
+            flash('Admin password not configured. Please set ADMIN_PASSWORD in .env file.', 'error')
+            return render_template('login.html')
+        
+        if password == admin_password:
+            user = AdminUser('admin')
+            login_user(user, remember=True)
+            next_page = request.args.get('next')
+            return redirect(next_page) if next_page else redirect(url_for('dashboard'))
+        else:
+            flash('Invalid password. Please try again.', 'error')
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+@login_required
+def logout():
+    """Logout the user."""
+    logout_user()
+    return redirect(url_for('login'))
+
 @app.route('/')
+@login_required
 def dashboard():
     """Main dashboard page."""
     return render_template('dashboard.html')
 
 @app.route('/flows')
+@login_required
 def flows():
     """Flows management page."""
     return render_template('flows.html')
 
 @app.route('/cron-jobs')
+@login_required
 def cron_jobs():
     """Cron jobs status page."""
     return render_template('cron_jobs.html')
 
 @app.route('/jobs')
+@login_required
 def jobs():
     """Jobs management page."""
     return render_template('jobs.html')
 
 @app.route('/api/flows')
+@login_required
 def api_flows():
     """API endpoint to get all flows."""
     try:
@@ -113,6 +166,7 @@ def api_flows():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/flows/<flow_id>/schema')
+@login_required
 def api_flow_schema(flow_id):
     """API endpoint to get flow input schema."""
     try:
@@ -143,6 +197,7 @@ def api_flow_schema(flow_id):
             conn.close()
 
 @app.route('/api/cron-status')
+@login_required
 def api_cron_status():
     """API endpoint to get cron job status."""
     try:
@@ -325,6 +380,7 @@ def api_cron_status():
         return jsonify({'error': str(e), 'details': error_details}), 500
 
 @app.route('/api/jobs')
+@login_required
 def api_jobs():
     """API endpoint to get all jobs."""
     try:
@@ -408,6 +464,7 @@ def api_jobs():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/jobs/<job_id>')
+@login_required
 def api_job_details(job_id):
     """API endpoint to get job details."""
     try:
@@ -419,7 +476,8 @@ def api_job_details(job_id):
                    j.input_data, j.payment_data, j.result, j.reasoning,
                    j.input_hash, j.created_at, j.updated_at, j.message,
                    f.summary as flow_summary, f.agent_identifier,
-                   j.waiting_for_start_in_kodosumi, j.kodosumi_start_attempts
+                   j.waiting_for_start_in_kodosumi, j.kodosumi_start_attempts,
+                   f.mip003_schema
             FROM jobs j 
             LEFT JOIN flows f ON j.flow_uid = f.uid 
             WHERE j.job_id = %s
@@ -433,6 +491,7 @@ def api_job_details(job_id):
         input_data = row[4]  # Already a dict/list from JSONB
         payment_data = row[5]  # Already a dict/list from JSONB  
         result_data = row[6]  # Already a dict/list from JSONB
+        mip003_schema = row[16]  # MIP003 schema from flow
         
         # Extract blockchain identifier from nested payment data structure
         blockchain_identifier = None
@@ -462,7 +521,8 @@ def api_job_details(job_id):
             'blockchain_identifier': blockchain_identifier,
             'waiting_for_start_in_kodosumi': row[14],
             'kodosumi_start_attempts': row[15],
-            'kodosumi_fid': result_data.get('kodosumi_fid') if result_data else None
+            'kodosumi_fid': result_data.get('kodosumi_fid') if result_data else None,
+            'mip003_schema': mip003_schema  # Include MIP003 schema for field names
         }
         
         cursor.close()
@@ -477,6 +537,7 @@ def api_job_details(job_id):
         return jsonify({'error': str(e), 'details': error_details}), 500
 
 @app.route('/api/stats')
+@login_required
 def api_stats():
     """API endpoint to get dashboard statistics."""
     try:
@@ -534,6 +595,7 @@ def api_stats():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/flows/<int:flow_id>/agent', methods=['PUT'])
+@login_required
 def update_flow_agent(flow_id):
     """API endpoint to update flow agent identifier."""
     try:

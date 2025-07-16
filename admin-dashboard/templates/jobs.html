@@ -103,6 +103,15 @@ function getStatusBadge(status) {
     return statusMap[status] || `<span class="badge bg-secondary">${status}</span>`;
 }
 
+function escapeHtml(unsafe) {
+    return unsafe
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
 function createJobCard(job) {
     const card = document.createElement('div');
     card.className = 'card mb-3';
@@ -112,6 +121,56 @@ function createJobCard(job) {
     const requestedFunds = paymentData.RequestedFunds || [];
     const paymentSource = paymentData.PaymentSource || {};
     const smartContractWallet = paymentData.SmartContractWallet || {};
+    
+    // Process input data with MIP003 schema
+    let inputDataHtml = '<div class="text-muted">No input data</div>';
+    if (job.input_data && Object.keys(job.input_data).length > 0) {
+        const fieldMap = {};
+        if (job.mip003_schema && Array.isArray(job.mip003_schema)) {
+            job.mip003_schema.forEach(field => {
+                fieldMap[field.id] = field;
+            });
+        }
+        
+        inputDataHtml = '<table class="table table-sm table-bordered">';
+        inputDataHtml += '<thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>';
+        
+        for (const [key, value] of Object.entries(job.input_data)) {
+            const fieldDef = fieldMap[key];
+            const fieldName = fieldDef?.name || key;
+            const fieldType = fieldDef?.type || 'unknown';
+            
+            let displayValue = value;
+            
+            // Handle different value types
+            if (value === null || value === undefined) {
+                displayValue = '<span class="text-muted">null</span>';
+            } else if (Array.isArray(value)) {
+                // Handle multi-select fields
+                if (fieldType === 'option' && fieldDef?.data?.values) {
+                    const values = fieldDef.data.values;
+                    displayValue = value.map(idx => {
+                        if (typeof idx === 'number' && idx >= 0 && idx < values.length) {
+                            return values[idx];
+                        }
+                        return idx;
+                    }).join(', ');
+                } else {
+                    displayValue = JSON.stringify(value);
+                }
+            } else if (typeof value === 'object') {
+                displayValue = `<pre class="mb-0">${JSON.stringify(value, null, 2)}</pre>`;
+            } else if (typeof value === 'string' && value.length > 100) {
+                displayValue = `<div class="text-truncate" style="max-width: 300px;" title="${escapeHtml(value)}">${escapeHtml(value)}</div>`;
+            } else {
+                displayValue = escapeHtml(String(value));
+            }
+            
+            inputDataHtml += `<tr><td><strong>${escapeHtml(fieldName)}</strong><br><small class="text-muted">${key} (${fieldType})</small></td><td>${displayValue}</td></tr>`;
+        }
+        
+        inputDataHtml += '</tbody></table>';
+    }
     
     // Helper function to convert timestamps
     function formatTimestamp(timestamp) {
@@ -199,6 +258,12 @@ function createJobCard(job) {
                     </div>
                     ` : ''}
                     ${job.message ? `<div><strong>Message:</strong> ${job.message}</div>` : ''}
+                </div>
+            </div>
+            <div class="row mt-3">
+                <div class="col-12">
+                    <h6>User Input Data</h6>
+                    ${inputDataHtml}
                 </div>
             </div>
         </div>
