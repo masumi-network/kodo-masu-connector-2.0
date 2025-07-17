@@ -20,7 +20,7 @@ class MIP003Converter:
             'text': 'string',
             'password': 'string',
             'number': 'number',
-            'textarea': 'string',
+            'textarea': 'textarea',
             'date': 'string',
             'time': 'string',
             'datetime-local': 'string',

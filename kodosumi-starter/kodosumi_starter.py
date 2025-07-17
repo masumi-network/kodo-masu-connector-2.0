@@ -200,8 +200,8 @@ class KodosumiStarter:
                             for v in validations
                         )
                         if is_optional:
-                            # Add empty string for optional string fields
-                            if field.get('type') == 'string':
+                            # Add empty string for optional string/textarea fields
+                            if field.get('type') in ['string', 'textarea']:
                                 payload[field_id] = ""
                                 logger.info(f"Added empty string for optional field: {field_id}")
             else:

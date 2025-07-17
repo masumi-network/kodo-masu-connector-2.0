@@ -60,7 +60,7 @@ def validate_input_data(
             continue
         
         # Validate based on type
-        if field_type == 'string':
+        if field_type == 'string' or field_type == 'textarea':
             validate_string_field(field_id, value, field, validations)
         elif field_type == 'number':
             validate_number_field(field_id, value, field, validations)
