@@ -430,7 +430,7 @@ def api_jobs():
             FROM jobs j 
             LEFT JOIN flows f ON j.flow_uid = f.uid 
             {where_clause}
-            ORDER BY j.created_at DESC
+            ORDER BY j.created_at DESC, j.job_id DESC
             LIMIT %s OFFSET %s
         """
         cursor.execute(jobs_query, params + [per_page, offset])
@@ -456,13 +456,17 @@ def api_jobs():
         cursor.close()
         conn.close()
         
-        return jsonify({
+        response = jsonify({
             'jobs': jobs,
             'total': total_count,
             'page': page,
             'per_page': per_page,
             'pages': (total_count + per_page - 1) // per_page
         })
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -532,7 +536,11 @@ def api_job_details(job_id):
         cursor.close()
         conn.close()
         
-        return jsonify(job)
+        response = jsonify(job)
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
         
     except Exception as e:
         import traceback

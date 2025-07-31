@@ -132,11 +132,29 @@ def fetch_flow_input_schema(api_key: str, flow_url: str) -> Optional[Dict]:
         print(f"Error fetching input schema for {flow_url}: {str(e)}")
         return None
 
+def normalize_url(url: str) -> str:
+    """Normalize specific flow URLs for consistency."""
+    if not url:
+        return url
+    
+    # Only normalize the X (Twitter) Analyzer flow URL
+    if 'x-analyzer' in url:
+        normalized_url = url.replace('x-analyzer', 'x_analyzer')
+        print(f"   ℹ Normalized URL: {url} -> {normalized_url}")
+        return normalized_url
+    
+    # Return all other URLs unchanged
+    return url
+
 def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
     """Insert or update a flow in the database with MIP003 conversion."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # Normalize the URL to use underscores instead of hyphens
+        original_url = flow_data.get('url')
+        normalized_url = normalize_url(original_url)
         
         # Convert input schema to MIP003 format
         mip003_schema = None
@@ -148,7 +166,7 @@ def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
                 print(f"   ⚠ MIP003 conversion failed: {str(e)}")
                 mip003_schema = None
         
-        # Prepare the upsert query
+        # Prepare the upsert query - using summary as the key instead of uid
         upsert_query = """
             INSERT INTO flows (
                 uid, author, deprecated, description, method, 
@@ -156,14 +174,14 @@ def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
-            ON CONFLICT (uid) DO UPDATE SET
+            ON CONFLICT (summary) DO UPDATE SET
+                uid = EXCLUDED.uid,
                 author = EXCLUDED.author,
                 deprecated = EXCLUDED.deprecated,
                 description = EXCLUDED.description,
                 method = EXCLUDED.method,
                 organization = EXCLUDED.organization,
                 source = EXCLUDED.source,
-                summary = EXCLUDED.summary,
                 tags = EXCLUDED.tags,
                 url = EXCLUDED.url,
                 input_schema = EXCLUDED.input_schema,
@@ -183,7 +201,7 @@ def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
             flow_data.get('source'),
             flow_data.get('summary'),
             flow_data.get('tags', []),
-            flow_data.get('url'),
+            normalized_url,  # Use normalized URL instead of original
             json.dumps(input_schema) if input_schema else None,
             json.dumps(mip003_schema) if mip003_schema else None
         ))
@@ -232,7 +250,8 @@ async def sync_flows_with_logging():
             flow_uid = flow.get('uid', 'unknown')
             flow_url = flow.get('url')
             
-            print(f"\nProcessing flow: {flow.get('summary', 'Unknown')} (UID: {flow_uid})")
+            flow_summary = flow.get('summary', 'Unknown')
+            print(f"\nProcessing flow: {flow_summary} (UID: {flow_uid})")
             
             # Fetch input schema for this flow
             input_schema = None
@@ -242,10 +261,10 @@ async def sync_flows_with_logging():
             # Upsert the flow to database
             if upsert_flow(flow, input_schema):
                 success_count += 1
-                print(f"✓ Successfully synced flow: {flow_uid}")
+                print(f"✓ Successfully synced flow: {flow_summary} (was UID: {flow_uid})")
             else:
                 error_count += 1
-                print(f"✗ Failed to sync flow: {flow_uid}")
+                print(f"✗ Failed to sync flow: {flow_summary} (UID: {flow_uid})")
         
         items_processed = success_count
         if error_count > 0:

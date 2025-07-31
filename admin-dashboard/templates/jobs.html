@@ -43,10 +43,17 @@
 <script>
 let currentPage = 1;
 let currentSearch = '';
+let isLoading = false;
 
 async function loadJobs(page = 1, search = '') {
+    // Prevent multiple simultaneous loads
+    if (isLoading) {
+        console.log('Already loading jobs, skipping...');
+        return;
+    }
+    isLoading = true;
     try {
-        const response = await fetch(`/api/jobs?page=${page}&per_page=20&search=${encodeURIComponent(search)}`);
+        const response = await fetch(`/api/jobs?page=${page}&per_page=20&search=${encodeURIComponent(search)}&_t=${Date.now()}`);
         const data = await response.json();
         
         const jobsContainer = document.getElementById('jobs-container');
@@ -57,25 +64,33 @@ async function loadJobs(page = 1, search = '') {
             return;
         }
         
-        // Fetch detailed data for each job
-        for (const job of data.jobs) {
+        // Fetch all job details in parallel but maintain order
+        const jobPromises = data.jobs.map(async (job) => {
             try {
-                const detailResponse = await fetch(`/api/jobs/${job.job_id}`);
+                const detailResponse = await fetch(`/api/jobs/${job.job_id}?_t=${Date.now()}`);
                 const jobDetail = await detailResponse.json();
                 
                 if (!jobDetail.error) {
-                    const jobCard = createJobCard(jobDetail);
-                    jobsContainer.appendChild(jobCard);
+                    return { type: 'detailed', data: jobDetail };
                 } else {
                     // Fallback to basic job info if details fail
-                    const jobCard = createBasicJobCard(job);
-                    jobsContainer.appendChild(jobCard);
+                    return { type: 'basic', data: job };
                 }
             } catch (error) {
                 console.error(`Error loading details for job ${job.job_id}:`, error);
-                const jobCard = createBasicJobCard(job);
-                jobsContainer.appendChild(jobCard);
+                return { type: 'basic', data: job };
             }
+        });
+        
+        // Wait for all jobs to load and then render them in order
+        const jobResults = await Promise.all(jobPromises);
+        
+        // Render jobs in the original order
+        for (const result of jobResults) {
+            const jobCard = result.type === 'detailed' 
+                ? createJobCard(result.data) 
+                : createBasicJobCard(result.data);
+            jobsContainer.appendChild(jobCard);
         }
         
         // Update pagination
@@ -87,6 +102,8 @@ async function loadJobs(page = 1, search = '') {
     } catch (error) {
         console.error('Error loading jobs:', error);
         document.getElementById('jobs-container').innerHTML = '<div class="text-center text-danger">Error loading jobs</div>';
+    } finally {
+        isLoading = false;
     }
 }
 
