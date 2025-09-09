@@ -1,0 +1,295 @@
+{% extends "base.html" %}
+
+{% block header %}Container Logs{% endblock %}
+<!-- Updated: {{ now }} -->
+
+{% block content %}
+<div class="container-fluid">
+    <h1 class="h3 mb-4 text-gray-800">Container Logs</h1>
+    
+    <div class="row">
+        <div class="col-md-3">
+            <div class="card shadow mb-4">
+                <div class="card-header py-3">
+                    <h6 class="m-0 font-weight-bold text-primary">Select Container</h6>
+                </div>
+                <div class="card-body">
+                    <div class="list-group" id="containerList">
+                        <a href="#" class="list-group-item list-group-item-action active" data-container="kodosumi-starter">
+                            <i class="fas fa-play-circle"></i> Job Starter
+                        </a>
+                        <a href="#" class="list-group-item list-group-item-action" data-container="kodosumi-status">
+                            <i class="fas fa-sync"></i> Status Checker
+                        </a>
+                        <a href="#" class="list-group-item list-group-item-action" data-container="kodosumi-authenticator">
+                            <i class="fas fa-key"></i> Authenticator
+                        </a>
+                        <a href="#" class="list-group-item list-group-item-action" data-container="kodosumi-flow-sync">
+                            <i class="fas fa-stream"></i> Flow Sync
+                        </a>
+                        <a href="#" class="list-group-item list-group-item-action" data-container="kodosumi-payment-checker">
+                            <i class="fas fa-credit-card"></i> Payment Checker
+                        </a>
+                        <a href="#" class="list-group-item list-group-item-action" data-container="kodo-masu-connector-20-api-server-1">
+                            <i class="fas fa-server"></i> API Server 1
+                        </a>
+                        <a href="#" class="list-group-item list-group-item-action" data-container="kodosumi-postgres">
+                            <i class="fas fa-database"></i> Database
+                        </a>
+                    </div>
+                    
+                    <div class="mt-3">
+                        <label for="logLines">Number of lines:</label>
+                        <select class="form-control" id="logLines">
+                            <option value="50">50</option>
+                            <option value="100" selected>100</option>
+                            <option value="200">200</option>
+                            <option value="500">500</option>
+                            <option value="1000">1000</option>
+                        </select>
+                    </div>
+                    
+                    <button class="btn btn-primary btn-block mt-3" id="refreshLogs">
+                        <i class="fas fa-sync-alt"></i> Refresh
+                    </button>
+                    
+                    <div class="custom-control custom-switch mt-3">
+                        <input type="checkbox" class="custom-control-input" id="autoRefresh">
+                        <label class="custom-control-label" for="autoRefresh">Auto-refresh (10s)</label>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-9">
+            <div class="card shadow mb-4">
+                <div class="card-header py-3 d-flex justify-content-between align-items-center">
+                    <h6 class="m-0 font-weight-bold text-primary" id="logsTitle">
+                        Logs: <span id="containerName">Job Starter</span>
+                    </h6>
+                    <div>
+                        <button class="btn btn-sm btn-secondary" id="downloadLogs">
+                            <i class="fas fa-download"></i> Download
+                        </button>
+                        <button class="btn btn-sm btn-info" id="searchToggle">
+                            <i class="fas fa-search"></i> Search
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div id="searchBox" class="mb-3" style="display: none;">
+                        <input type="text" class="form-control" id="searchInput" placeholder="Search logs...">
+                    </div>
+                    
+                    <div id="logsContainer" style="height: 600px; overflow-y: auto; font-family: monospace; font-size: 12px;">
+                        <div class="text-center">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="sr-only">Loading...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    #logsContainer {
+        background-color: #1e1e1e;
+        color: #d4d4d4;
+        padding: 15px;
+        border-radius: 5px;
+    }
+    
+    .log-line {
+        margin-bottom: 2px;
+        word-wrap: break-word;
+        padding: 2px 0;
+    }
+    
+    .log-line:hover {
+        background-color: #2d2d2d;
+    }
+    
+    .log-timestamp {
+        color: #569cd6;
+    }
+    
+    .log-level-INFO {
+        color: #4ec9b0;
+    }
+    
+    .log-level-WARNING {
+        color: #dcdcaa;
+    }
+    
+    .log-level-ERROR {
+        color: #f44747;
+    }
+    
+    .log-highlight {
+        background-color: #515c6c;
+    }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let currentContainer = 'kodosumi-starter';
+    let autoRefreshInterval = null;
+    let allLogs = [];
+    
+    function formatLogLine(line) {
+        // Highlight different log levels
+        if (line.includes('ERROR') || line.includes('CRITICAL')) {
+            return line.replace(/(ERROR|CRITICAL)/g, '<span class="log-level-ERROR">$1</span>');
+        } else if (line.includes('WARNING') || line.includes('WARN')) {
+            return line.replace(/(WARNING|WARN)/g, '<span class="log-level-WARNING">$1</span>');
+        } else if (line.includes('INFO')) {
+            return line.replace(/INFO/g, '<span class="log-level-INFO">INFO</span>');
+        }
+        
+        // Highlight timestamps (ISO format)
+        line = line.replace(/(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}[\.,]\d+)/g, '<span class="log-timestamp">$1</span>');
+        
+        return line;
+    }
+    
+    function loadLogs(container) {
+        const lines = document.getElementById('logLines').value;
+        console.log(`Loading logs for container: ${container} with ${lines} lines`);
+        
+        const logsContainer = document.getElementById('logsContainer');
+        logsContainer.innerHTML = '<div class="text-center"><div class="spinner-border text-primary" role="status"><span class="sr-only">Loading...</span></div></div>';
+        
+        fetch(`/api/logs/${container}?lines=${lines}`)
+            .then(response => {
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        throw new Error('Authentication required. Please refresh the page and login.');
+                    } else if (response.status === 0) {
+                        throw new Error('Network error. Please check your connection.');
+                    }
+                    return response.json().then(err => {
+                        throw new Error(err.error || `HTTP ${response.status}: ${response.statusText}`);
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                console.log('Logs loaded successfully:', data);
+                allLogs = data.logs || [];
+                displayLogs(allLogs);
+                
+                document.getElementById('containerName').textContent = container;
+                logsContainer.scrollTop = logsContainer.scrollHeight;
+            })
+            .catch(error => {
+                console.error('Failed to load logs:', error);
+                logsContainer.innerHTML = `
+                    <div class="alert alert-danger">
+                        Failed to load logs: ${error.message}
+                    </div>
+                `;
+            });
+    }
+    
+    function displayLogs(logs, searchTerm = '') {
+        let html = '';
+        logs.forEach(function(line, index) {
+            if (searchTerm && !line.toLowerCase().includes(searchTerm.toLowerCase())) {
+                return;
+            }
+            
+            let formattedLine = formatLogLine(line);
+            if (searchTerm) {
+                const regex = new RegExp(`(${searchTerm})`, 'gi');
+                formattedLine = formattedLine.replace(regex, '<span class="log-highlight">$1</span>');
+            }
+            
+            html += `<div class="log-line">${formattedLine}</div>`;
+        });
+        
+        document.getElementById('logsContainer').innerHTML = html || '<div class="text-muted">No logs found</div>';
+    }
+    
+    function downloadLogs() {
+        const logText = allLogs.join('\n');
+        const blob = new Blob([logText], { type: 'text/plain' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${currentContainer}-logs-${new Date().toISOString()}.log`;
+        a.click();
+        window.URL.revokeObjectURL(url);
+    }
+    
+    // Container selection
+    document.getElementById('containerList').addEventListener('click', function(e) {
+        if (e.target.tagName === 'A' || e.target.closest('a')) {
+            e.preventDefault();
+            const link = e.target.tagName === 'A' ? e.target : e.target.closest('a');
+            
+            // Remove active class from all links
+            document.querySelectorAll('#containerList a').forEach(a => a.classList.remove('active'));
+            // Add active class to clicked link
+            link.classList.add('active');
+            
+            currentContainer = link.getAttribute('data-container');
+            loadLogs(currentContainer);
+        }
+    });
+    
+    // Refresh button
+    document.getElementById('refreshLogs').addEventListener('click', function() {
+        loadLogs(currentContainer);
+    });
+    
+    // Auto-refresh
+    document.getElementById('autoRefresh').addEventListener('change', function() {
+        if (this.checked) {
+            autoRefreshInterval = setInterval(function() {
+                loadLogs(currentContainer);
+            }, 10000); // 10 seconds
+        } else {
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = null;
+            }
+        }
+    });
+    
+    // Search functionality
+    document.getElementById('searchToggle').addEventListener('click', function() {
+        const searchBox = document.getElementById('searchBox');
+        if (searchBox.style.display === 'none' || searchBox.style.display === '') {
+            searchBox.style.display = 'block';
+            document.getElementById('searchInput').focus();
+        } else {
+            searchBox.style.display = 'none';
+        }
+    });
+    
+    document.getElementById('searchInput').addEventListener('input', function() {
+        const searchTerm = this.value;
+        displayLogs(allLogs, searchTerm);
+    });
+    
+    // Download logs
+    document.getElementById('downloadLogs').addEventListener('click', downloadLogs);
+    
+    // Load initial logs when DOM is ready
+    document.addEventListener('DOMContentLoaded', function() {
+        console.log('Logs page loaded, loading logs for:', currentContainer);
+        loadLogs(currentContainer);
+    });
+    
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', function() {
+        if (autoRefreshInterval) {
+            clearInterval(autoRefreshInterval);
+        }
+    });
+</script>
+{% endblock %}

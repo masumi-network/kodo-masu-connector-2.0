@@ -14,6 +14,10 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
 
+# Disable template caching in development
+app.config['TEMPLATES_AUTO_RELOAD'] = True
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+
 # Initialize Flask-Login
 login_manager = LoginManager()
 login_manager.init_app(app)
@@ -620,6 +624,86 @@ def update_flow_agent(flow_id):
         conn.close()
         
         return jsonify({'success': True, 'agent_identifier': agent_identifier})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/logs')
+@login_required
+def logs():
+    """Display logs page."""
+    app.logger.info("[LOGS] Logs page accessed")
+    from datetime import datetime
+    import time
+    return render_template('logs.html', now=datetime.now().isoformat(), version=int(time.time()))
+
+@app.route('/api/logs/test')
+@login_required
+def test_logs_api():
+    """Test endpoint for logs API."""
+    return jsonify({'status': 'ok', 'message': 'Logs API is working'})
+
+@app.route('/logs_debug')
+@login_required
+def logs_debug():
+    """Display debug logs page."""
+    return render_template('logs_debug.html')
+
+@app.route('/api/logs/<container_name>')
+@login_required
+def get_container_logs(container_name):
+    """Get logs for a specific container."""
+    try:
+        import subprocess
+        
+        app.logger.info(f"[LOGS API] Fetching logs for container: {container_name}")
+        
+        # Whitelist of allowed container names
+        allowed_containers = [
+            'kodosumi-starter',
+            'kodosumi-status',
+            'kodosumi-authenticator',
+            'kodosumi-flow-sync',
+            'kodosumi-payment-checker',
+            'kodo-masu-connector-20-api-server-1',
+            'kodo-masu-connector-20-api-server-2',
+            'kodo-masu-connector-20-api-server-3',
+            'kodosumi-postgres',
+            'kodosumi-nginx'
+        ]
+        
+        if container_name not in allowed_containers:
+            app.logger.error(f"[LOGS API] Invalid container name: {container_name}")
+            return jsonify({'error': 'Invalid container name'}), 400
+        
+        # Get number of lines from query parameter (default 100)
+        lines = request.args.get('lines', '100')
+        try:
+            lines = str(int(lines))  # Validate it's a number
+        except:
+            lines = '100'
+        
+        # Get logs from Docker
+        cmd = ['docker', 'logs', '--tail', lines, container_name]
+        app.logger.info(f"Running command: {' '.join(cmd)}")
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, stderr=subprocess.STDOUT)
+        
+        app.logger.info(f"Command return code: {result.returncode}")
+        app.logger.info(f"Output length: {len(result.stdout)} characters")
+        
+        if result.returncode != 0:
+            app.logger.error(f"Docker command failed: {result.stdout}")
+            return jsonify({'error': 'Failed to get logs', 'details': result.stdout}), 500
+        
+        # Split logs into lines and reverse to show newest first
+        log_lines = result.stdout.strip().split('\n')
+        
+        return jsonify({
+            'container': container_name,
+            'logs': log_lines,
+            'line_count': len(log_lines)
+        })
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500

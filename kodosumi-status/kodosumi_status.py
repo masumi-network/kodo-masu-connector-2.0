@@ -74,12 +74,14 @@ class KodosumiStatusChecker:
             SELECT j.job_id, j.flow_uid, j.status, 
                    j.result->>'kodosumi_fid' as kodosumi_fid,
                    j.payment_data, j.input_data, j.identifier_from_purchaser,
-                   j.created_at, j.updated_at,
+                   j.created_at, j.updated_at, j.timeout_attempts, j.not_found_attempts,
                    f.summary as flow_summary, f.agent_identifier
             FROM jobs j
             LEFT JOIN flows f ON j.flow_uid = f.uid
             WHERE j.status = 'running' 
               AND j.result->>'kodosumi_fid' IS NOT NULL
+              AND j.timeout_attempts < 3
+              AND j.not_found_attempts < 3
             ORDER BY j.created_at ASC
         """
         
@@ -102,7 +104,9 @@ class KodosumiStatusChecker:
                 'identifier_from_purchaser': row['identifier_from_purchaser'],
                 'agent_identifier': row['agent_identifier'],
                 'created_at': row['created_at'],
-                'updated_at': row['updated_at']
+                'updated_at': row['updated_at'],
+                'timeout_attempts': row['timeout_attempts'],
+                'not_found_attempts': row['not_found_attempts']
             })
         
         return jobs
@@ -110,8 +114,8 @@ class KodosumiStatusChecker:
     async def check_job_status(self, fid: str, api_key: str) -> Optional[Dict[str, Any]]:
         """Check the status of a job in Kodosumi."""
         try:
-            # Construct the status URL with extended=true for better reliability
-            status_url = f"{self.kodosumi_server_url}/outputs/status/{fid}?extended=true"
+            # Construct the status URL (removed extended=true as it causes timeouts)
+            status_url = f"{self.kodosumi_server_url}/outputs/status/{fid}"
             
             logger.info(f"Checking status for FID {fid} at: {status_url}")
             
@@ -132,7 +136,16 @@ class KodosumiStatusChecker:
                     result = response.json()
                     logger.info(f"Status for FID {fid}: {result.get('status', 'unknown')}")
                     return result
+                elif response.status_code == 404:
+                    # Job not found in Kodosumi - might not be indexed yet
+                    logger.warning(f"Job FID {fid} not found in Kodosumi (404) - might not be indexed yet")
+                    return {"error": "not_found", "status_code": 404}
+                elif response.status_code in [400, 401, 403]:
+                    # Client errors - likely won't resolve with retries
+                    logger.error(f"Client error for FID {fid}. Status: {response.status_code}, Response: {response.text}")
+                    return {"error": "client_error", "status_code": response.status_code}
                 else:
+                    # Server errors (5xx) or other - might be temporary
                     logger.error(f"Failed to get status for FID {fid}. Status: {response.status_code}, Response: {response.text}")
                     return None
                     
@@ -141,7 +154,7 @@ class KodosumiStatusChecker:
             return None
         except httpx.TimeoutException:
             logger.warning(f"Timeout while checking status for FID {fid}")
-            return None
+            return {"timeout": True}
         except Exception as e:
             logger.error(f"Error checking status for FID {fid}: {e}")
             return None
@@ -178,6 +191,52 @@ class KodosumiStatusChecker:
                 
         except Exception as e:
             logger.error(f"Failed to update completed job {job_id}: {e}")
+            return False
+    
+    async def increment_timeout_attempts(self, conn: asyncpg.Connection, job_id: str) -> bool:
+        """Increment timeout attempts for a job."""
+        try:
+            query = """
+                UPDATE jobs 
+                SET timeout_attempts = timeout_attempts + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = $1::uuid
+            """
+            
+            result = await conn.execute(query, job_id)
+            
+            if result == "UPDATE 1":
+                logger.info(f"Incremented timeout attempts for job {job_id}")
+                return True
+            else:
+                logger.warning(f"No rows updated for job {job_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to increment timeout attempts for job {job_id}: {e}")
+            return False
+    
+    async def increment_not_found_attempts(self, conn: asyncpg.Connection, job_id: str) -> bool:
+        """Increment not found (404) attempts for a job."""
+        try:
+            query = """
+                UPDATE jobs 
+                SET not_found_attempts = not_found_attempts + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = $1::uuid
+            """
+            
+            result = await conn.execute(query, job_id)
+            
+            if result == "UPDATE 1":
+                logger.info(f"Incremented not_found_attempts for job {job_id}")
+                return True
+            else:
+                logger.warning(f"No rows updated for job {job_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to increment not_found_attempts for job {job_id}: {e}")
             return False
     
     def extract_blockchain_identifier(self, payment_data: Dict[str, Any]) -> Optional[str]:
@@ -251,6 +310,55 @@ class KodosumiStatusChecker:
                 status_result = await self.check_job_status(fid, kodosumi_api_key)
                 
                 if status_result:
+                    # Check if this was a timeout
+                    if status_result.get('timeout'):
+                        logger.warning(f"Job {job_id} timed out - incrementing timeout attempts")
+                        await self.increment_timeout_attempts(conn, job_id)
+                        timeout_attempts = job.get('timeout_attempts', 0) + 1
+                        if timeout_attempts >= 3:
+                            logger.error(f"Job {job_id} has timed out {timeout_attempts} times - marking as failed")
+                            # Mark job as failed after 3 timeouts
+                            await conn.execute(
+                                "UPDATE jobs SET status = 'failed', message = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2::uuid",
+                                f"Job timed out {timeout_attempts} times - likely never started in Kodosumi",
+                                job_id
+                            )
+                            jobs_processed += 1
+                        continue
+                    
+                    # Check if this was an error response
+                    if status_result.get('error'):
+                        error_type = status_result.get('error')
+                        status_code = status_result.get('status_code')
+                        
+                        if error_type == 'not_found':
+                            # Job not found in Kodosumi - increment attempts and retry
+                            logger.warning(f"Job {job_id} not found in Kodosumi (404) - incrementing not_found_attempts")
+                            await self.increment_not_found_attempts(conn, job_id)
+                            not_found_attempts = job.get('not_found_attempts', 0) + 1
+                            if not_found_attempts >= 3:
+                                logger.error(f"Job {job_id} not found after {not_found_attempts} attempts - marking as failed")
+                                # Mark job as failed after 3 404 attempts
+                                await conn.execute(
+                                    "UPDATE jobs SET status = 'failed', message = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2::uuid",
+                                    f"Job not found in Kodosumi after {not_found_attempts} attempts (HTTP 404)",
+                                    job_id
+                                )
+                                jobs_processed += 1
+                            else:
+                                logger.info(f"Job {job_id} not found (attempt {not_found_attempts}/3), will retry later")
+                            continue
+                        elif error_type == 'client_error':
+                            # Client error - also mark as failed as it won't resolve
+                            logger.error(f"Job {job_id} failed with client error {status_code} - marking as failed")
+                            await conn.execute(
+                                "UPDATE jobs SET status = 'failed', message = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2::uuid",
+                                f"Kodosumi API client error (HTTP {status_code})",
+                                job_id
+                            )
+                            jobs_processed += 1
+                            continue
+                    
                     status = status_result.get('status', 'unknown')
                     
                     if status == 'finished':
