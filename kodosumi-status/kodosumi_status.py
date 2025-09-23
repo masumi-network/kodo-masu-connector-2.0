@@ -74,8 +74,10 @@ class KodosumiStatusChecker:
             SELECT j.job_id, j.flow_uid, j.status, 
                    j.result->>'kodosumi_fid' as kodosumi_fid,
                    j.payment_data, j.input_data, j.identifier_from_purchaser,
+                   j.agent_identifier_used, j.payment_required,
                    j.created_at, j.updated_at, j.timeout_attempts, j.not_found_attempts,
-                   f.summary as flow_summary, f.agent_identifier
+                   f.summary as flow_summary,
+                   COALESCE(f.agent_identifier_default, f.agent_identifier) AS flow_agent_identifier
             FROM jobs j
             LEFT JOIN flows f ON j.flow_uid = f.uid
             WHERE j.status = 'running' 
@@ -102,7 +104,8 @@ class KodosumiStatusChecker:
                 'payment_data': payment_data,
                 'input_data': input_data,
                 'identifier_from_purchaser': row['identifier_from_purchaser'],
-                'agent_identifier': row['agent_identifier'],
+                'agent_identifier': row['agent_identifier_used'] or row['flow_agent_identifier'],
+                'payment_required': row['payment_required'] if row['payment_required'] is not None else True,
                 'created_at': row['created_at'],
                 'updated_at': row['updated_at'],
                 'timeout_attempts': row['timeout_attempts'],
@@ -250,6 +253,10 @@ class KodosumiStatusChecker:
     
     async def submit_result_to_masumi(self, job: Dict[str, Any], final_result: str, api_key: str):
         """Submit job result to Masumi for payment completion."""
+        if not job.get('payment_required', True):
+            logger.info(f"Skipping payment completion for free job {job['job_id']}")
+            return
+
         try:
             # Use the database-based payment service
             completion_response = await DatabasePaymentService.complete_payment(

@@ -27,6 +27,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _load_max_attempts() -> int:
+    """Fetch the maximum number of start attempts from the environment."""
+    raw_value = os.getenv('KODOSUMI_START_MAX_ATTEMPTS', '10')
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid KODOSUMI_START_MAX_ATTEMPTS value '%s', defaulting to 10", raw_value)
+        parsed = 10
+    return max(1, parsed)
+
+MAX_START_ATTEMPTS = _load_max_attempts()
+
 class KodosumiStarter:
     """Service for starting jobs in Kodosumi."""
     
@@ -76,11 +88,11 @@ class KodosumiStarter:
             LEFT JOIN flows f ON j.flow_uid = f.uid
             WHERE j.status = 'running' 
               AND j.waiting_for_start_in_kodosumi = true
-              AND j.kodosumi_start_attempts < 5
+              AND j.kodosumi_start_attempts < $1
             ORDER BY j.created_at ASC
         """
         
-        rows = await conn.fetch(query)
+        rows = await conn.fetch(query, MAX_START_ATTEMPTS)
         jobs = []
         
         for row in rows:
@@ -374,12 +386,12 @@ class KodosumiStarter:
                 SELECT job_id FROM jobs 
                 WHERE status = 'running' 
                   AND waiting_for_start_in_kodosumi = true
-                  AND kodosumi_start_attempts >= 5
+                  AND kodosumi_start_attempts >= $1
             """
-            exceeded_rows = await conn.fetch(exceeded_query)
+            exceeded_rows = await conn.fetch(exceeded_query, MAX_START_ATTEMPTS)
             for row in exceeded_rows:
                 job_id = str(row['job_id'])
-                error_msg = f"Failed to start job in Kodosumi after 5 attempts"
+                error_msg = f"Failed to start job in Kodosumi after {MAX_START_ATTEMPTS} attempts"
                 await self.mark_job_as_error(conn, job_id, error_msg)
                 logger.warning(f"Marked job {job_id} as error (exceeded max attempts)")
             
@@ -388,7 +400,10 @@ class KodosumiStarter:
                 job_id = str(job['job_id'])
                 attempts = job['kodosumi_start_attempts']
                 
-                logger.info(f"Processing job {job_id} for flow: {job['flow_summary']} (attempt {attempts + 1}/5)")
+                logger.info(
+                    f"Processing job {job_id} for flow: {job['flow_summary']} "
+                    f"(attempt {attempts + 1}/{MAX_START_ATTEMPTS})"
+                )
                 
                 # Start job in Kodosumi
                 fid = await self.start_job_in_kodosumi(job, api_key, conn)
@@ -404,16 +419,25 @@ class KodosumiStarter:
                         logger.error(f"Failed to update job {job_id} in database")
                 else:
                     # Failed to start in Kodosumi
-                    logger.error(f"Failed to start job {job_id} in Kodosumi (attempt {attempts + 1}/5)")
+                    logger.error(
+                        f"Failed to start job {job_id} in Kodosumi "
+                        f"(attempt {attempts + 1}/{MAX_START_ATTEMPTS})"
+                    )
                     
                     # Increment retry count
                     await self.increment_retry_count(conn, job_id)
                     
                     # Check if this was the 5th attempt
-                    if attempts + 1 >= 5:
-                        error_msg = f"Failed to start job in Kodosumi after 5 attempts"
+                    if attempts + 1 >= MAX_START_ATTEMPTS:
+                        error_msg = (
+                            f"Failed to start job in Kodosumi after "
+                            f"{MAX_START_ATTEMPTS} attempts"
+                        )
                         await self.mark_job_as_error(conn, job_id, error_msg)
-                        logger.error(f"Job {job_id} marked as error after 5 failed attempts")
+                        logger.error(
+                            f"Job {job_id} marked as error after "
+                            f"{MAX_START_ATTEMPTS} failed attempts"
+                        )
             
             await conn.close()
             logger.info("Kodosumi job starting completed successfully")

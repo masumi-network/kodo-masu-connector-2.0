@@ -49,33 +49,35 @@ class PaymentChecker:
         query = """
             SELECT j.job_id, j.flow_uid, j.identifier_from_purchaser, j.input_data, 
                    j.payment_data, j.created_at, j.updated_at,
-                   f.agent_identifier
+                   j.agent_identifier_used, j.payment_required,
+                   COALESCE(f.agent_identifier_default, f.agent_identifier) AS flow_agent_identifier
             FROM jobs j
             LEFT JOIN flows f ON j.flow_uid = f.uid
-            WHERE j.status = 'awaiting_payment'
+            WHERE j.status = 'awaiting_payment' AND COALESCE(j.payment_required, TRUE) = TRUE
             ORDER BY j.created_at ASC
         """
-        
+
         rows = await conn.fetch(query)
         jobs = []
-        
+
         for row in rows:
             # Parse JSON fields
             import json
             input_data = json.loads(row['input_data']) if row['input_data'] else {}
             payment_data = json.loads(row['payment_data']) if row['payment_data'] else {}
-            
+
             jobs.append({
                 'job_id': row['job_id'],
                 'flow_uid': row['flow_uid'],
                 'identifier_from_purchaser': row['identifier_from_purchaser'],
                 'input_data': input_data,
                 'payment_data': payment_data,
-                'agent_identifier': row['agent_identifier'],
+                'agent_identifier': row['agent_identifier_used'] or row['flow_agent_identifier'],
+                'payment_required': row['payment_required'] if row['payment_required'] is not None else True,
                 'created_at': row['created_at'],
                 'updated_at': row['updated_at']
             })
-        
+
         return jobs
     
     async def get_payment_status_for_job(self, agent_identifier: str, job: Dict[str, Any]) -> Optional[Dict[str, Any]]:

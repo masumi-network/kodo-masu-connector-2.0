@@ -5,7 +5,7 @@ printenv | grep -E '^(POSTGRES_|KODOSUMI_|PAYMENT_)' | sed 's/=\(.*\)/="\1"/' | 
 
 # Start cron in foreground
 echo "Starting Kodosumi Status Checker cron service..."
-echo "Status checks will run every 2 minutes"
+echo "Status checks will run every 30 seconds"
 
 # Run initial check immediately
 echo "Running initial status check..."

@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS flows (
     url_identifier VARCHAR(255), -- URL-friendly identifier like "YouTubeChannelAnalysis"
     input_schema JSONB, -- Store the original Kodosumi input schema as JSON
     mip003_schema JSONB, -- Store the MIP003 compliant schema as JSON
+    agent_identifier VARCHAR(255), -- Legacy default agent identifier
+    agent_identifier_default VARCHAR(255), -- Primary agent identifier
+    premium_agent_identifier VARCHAR(255), -- Optional premium pricing identifier
+    free_agent_identifier VARCHAR(255), -- Optional free-mode identifier
+    free_mode_enabled BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -60,6 +65,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     reasoning TEXT,
     input_hash VARCHAR(255),
     blockchain_identifier VARCHAR(255),
+    agent_identifier_used VARCHAR(255),
+    payment_required BOOLEAN DEFAULT TRUE,
+    kodosumi_start_attempts INTEGER DEFAULT 0,
+    waiting_for_start_in_kodosumi BOOLEAN DEFAULT FALSE,
+    timeout_attempts INTEGER DEFAULT 0,
+    not_found_attempts INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (flow_uid) REFERENCES flows(uid)

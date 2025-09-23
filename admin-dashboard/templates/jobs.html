@@ -129,6 +129,18 @@ function escapeHtml(unsafe) {
         .replace(/'/g, "&#039;");
 }
 
+function renderOutputHash(outputHash) {
+    if (!outputHash) {
+        return '<span class="text-muted">N/A</span>';
+    }
+    return `
+        <code class="small">${escapeHtml(outputHash)}</code>
+        <button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${outputHash}')">
+            <i class="fas fa-copy"></i>
+        </button>
+    `;
+}
+
 function createJobCard(job) {
     const card = document.createElement('div');
     card.className = 'card mb-3';
@@ -241,13 +253,15 @@ function createJobCard(job) {
                 <div class="col-md-4">
                     <h6>Payment Information</h6>
                     <table class="table table-sm table-borderless">
+                        <tr><td><strong>Job ID:</strong></td><td><code class="small">${job.job_id}</code> <button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.job_id}')"><i class="fas fa-copy"></i></button></td></tr>
                         <tr><td><strong>Blockchain ID:</strong></td><td><code class="small">${job.blockchain_identifier ? job.blockchain_identifier.substring(0, 16) + '...' : 'N/A'}</code> ${job.blockchain_identifier ? `<button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.blockchain_identifier}')"><i class="fas fa-copy"></i></button>` : ''}</td></tr>
                         <tr><td><strong>Purchaser ID:</strong></td><td><code class="small">${job.identifier_from_purchaser}</code></td></tr>
                         <tr><td><strong>Input Hash:</strong></td><td><code class="small">${job.input_hash || paymentData.inputHash || 'N/A'}</code></td></tr>
+                        <tr><td><strong>Output Hash:</strong></td><td>${renderOutputHash(job.output_hash)}</td></tr>
                         <tr><td><strong>Agent ID:</strong></td><td><code class="small">${agentIdentifier}</code></td></tr>
                         <tr><td><strong>Waiting for Kodosumi:</strong></td><td>${job.waiting_for_start_in_kodosumi ? '<span class="badge bg-warning">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td></tr>
                         ${job.kodosumi_fid ? `<tr><td><strong>Kodosumi FID:</strong></td><td><code class="small">${job.kodosumi_fid}</code> <button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.kodosumi_fid}')"><i class="fas fa-copy"></i></button></td></tr>` : ''}
-                        ${job.kodosumi_start_attempts > 0 ? `<tr><td><strong>Start Attempts:</strong></td><td>${job.kodosumi_start_attempts}/5</td></tr>` : ''}
+                        ${job.kodosumi_start_attempts > 0 ? `<tr><td><strong>Start Attempts:</strong></td><td>${job.kodosumi_start_attempts}/{{ starter_max_attempts }}</td></tr>` : ''}
                     </table>
                 </div>
                 <div class="col-md-4">
@@ -312,11 +326,12 @@ function createBasicJobCard(job) {
             <div class="row">
                 <div class="col-md-6">
                     <table class="table table-sm table-borderless">
+                        <tr><td><strong>Job ID:</strong></td><td><code class="small">${job.job_id}</code> <button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.job_id}')"><i class="fas fa-copy"></i></button></td></tr>
                         <tr><td><strong>Blockchain ID:</strong></td><td><code class="small">${job.blockchain_identifier ? job.blockchain_identifier.substring(0, 16) + '...' : 'N/A'}</code> ${job.blockchain_identifier ? `<button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.blockchain_identifier}')"><i class="fas fa-copy"></i></button>` : ''}</td></tr>
                         <tr><td><strong>Purchaser ID:</strong></td><td><code class="small">${job.identifier_from_purchaser}</code></td></tr>
                         <tr><td><strong>Waiting for Kodosumi:</strong></td><td>${job.waiting_for_start_in_kodosumi ? '<span class="badge bg-warning">Yes</span>' : '<span class="badge bg-secondary">No</span>'}</td></tr>
                         ${job.kodosumi_fid ? `<tr><td><strong>Kodosumi FID:</strong></td><td><code class="small">${job.kodosumi_fid}</code> <button class="btn btn-sm btn-link p-0" onclick="copyToClipboard('${job.kodosumi_fid}')"><i class="fas fa-copy"></i></button></td></tr>` : ''}
-                        ${job.kodosumi_start_attempts > 0 ? `<tr><td><strong>Start Attempts:</strong></td><td>${job.kodosumi_start_attempts}/5</td></tr>` : ''}
+                        ${job.kodosumi_start_attempts > 0 ? `<tr><td><strong>Start Attempts:</strong></td><td>${job.kodosumi_start_attempts}/{{ starter_max_attempts }}</td></tr>` : ''}
                         <tr><td><strong>Created:</strong></td><td>${new Date(job.created_at).toLocaleString()}</td></tr>
                         <tr><td><strong>Updated:</strong></td><td>${new Date(job.updated_at).toLocaleString()}</td></tr>
                     </table>

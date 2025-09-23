@@ -4,6 +4,7 @@ from flask_login import LoginManager, UserMixin, login_user, logout_user, login_
 import psycopg2
 import json
 import os
+import hashlib
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import secrets
@@ -13,6 +14,28 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
+
+# Base endpoints shown in admin UI helpers
+RAW_API_BASE_URL = os.getenv('MIP003_API_BASE_URL', 'http://localhost:8000')
+RAW_KODOSUMI_URL = os.getenv('KODOSUMI_SERVER_URL', '')
+
+def _normalize_base(url: str) -> str:
+    return url[:-1] if url.endswith('/') else url
+
+API_BASE_URL = _normalize_base(RAW_API_BASE_URL)
+KODOSUMI_SERVER_URL = _normalize_base(RAW_KODOSUMI_URL)
+
+
+def _load_starter_max_attempts() -> int:
+    raw_value = os.getenv('KODOSUMI_START_MAX_ATTEMPTS', '10')
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        parsed = 10
+    return max(1, parsed)
+
+
+STARTER_MAX_ATTEMPTS = _load_starter_max_attempts()
 
 # Disable template caching in development
 app.config['TEMPLATES_AUTO_RELOAD'] = True
@@ -48,6 +71,39 @@ def get_db_connection():
     """Create and return a database connection."""
     return psycopg2.connect(**DB_CONFIG)
 
+
+def compute_result_hash(result_data):
+    """Compute SHA-256 hash of the final result payload if available."""
+    if not result_data:
+        return None
+
+    payload = None
+    if isinstance(result_data, dict):
+        for key in ('final_result', 'final', 'result', 'output'):
+            if key in result_data and result_data[key] not in (None, ''):
+                payload = result_data[key]
+                break
+        if payload is None:
+            payload = result_data
+    else:
+        payload = result_data
+
+    if payload is None:
+        return None
+
+    if not isinstance(payload, str):
+        try:
+            payload = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        except (TypeError, ValueError):
+            payload = str(payload)
+    else:
+        payload = payload.strip()
+
+    if not payload:
+        return None
+
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     """Login page."""
@@ -82,6 +138,16 @@ def dashboard():
     """Main dashboard page."""
     return render_template('dashboard.html')
 
+@app.context_processor
+def inject_global_urls():
+    """Expose commonly used URLs to all templates."""
+    return {
+        'api_base_url': API_BASE_URL,
+        'kodosumi_server_url': KODOSUMI_SERVER_URL,
+        'starter_max_attempts': STARTER_MAX_ATTEMPTS,
+    }
+
+
 @app.route('/flows')
 @login_required
 def flows():
@@ -112,14 +178,21 @@ def api_flows():
         page = request.args.get('page', 1, type=int)
         per_page = request.args.get('per_page', 10, type=int)
         search = request.args.get('search', '', type=str)
-        
-        # Build query with search
-        where_clause = ""
+        active_only = request.args.get('active_only', 0, type=int)
+
+        # Build query with optional filters
+        conditions = []
         params = []
+
         if search:
-            where_clause = "WHERE summary ILIKE %s OR description ILIKE %s OR author ILIKE %s"
-            params = [f"%{search}%", f"%{search}%", f"%{search}%"]
-        
+            conditions.append("(summary ILIKE %s OR description ILIKE %s OR author ILIKE %s)")
+            params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+
+        if active_only:
+            conditions.append("NULLIF(TRIM(COALESCE(agent_identifier_default, agent_identifier, '')), '') IS NOT NULL")
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
         # Get total count
         cursor.execute(f"SELECT COUNT(*) FROM flows {where_clause}", params)
         total_count = cursor.fetchone()[0]
@@ -127,9 +200,14 @@ def api_flows():
         # Get flows
         offset = (page - 1) * per_page
         cursor.execute(f"""
-            SELECT id, uid, author, deprecated, description, method, 
+            SELECT id, uid, author, deprecated, description, method,
                    organization, source, summary, tags, url, url_identifier,
-                   agent_identifier, created_at, updated_at
+                   agent_identifier,
+                   COALESCE(agent_identifier_default, agent_identifier) AS agent_identifier_default,
+                   premium_agent_identifier,
+                   free_agent_identifier,
+                   free_mode_enabled,
+                   created_at, updated_at
             FROM flows {where_clause}
             ORDER BY updated_at DESC
             LIMIT %s OFFSET %s
@@ -151,8 +229,12 @@ def api_flows():
                 'url': row[10],
                 'url_identifier': row[11],
                 'agent_identifier': row[12],
-                'created_at': row[13].isoformat() if row[13] else None,
-                'updated_at': row[14].isoformat() if row[14] else None
+                'agent_identifier_default': row[13],
+                'premium_agent_identifier': row[14],
+                'free_agent_identifier': row[15],
+                'free_mode_enabled': row[16],
+                'created_at': row[17].isoformat() if row[17] else None,
+                'updated_at': row[18].isoformat() if row[18] else None
             })
         
         cursor.close()
@@ -529,8 +611,9 @@ def api_job_details(job_id):
             'blockchain_identifier': blockchain_identifier,
             'waiting_for_start_in_kodosumi': row[14],
             'kodosumi_start_attempts': row[15],
-            'kodosumi_fid': result_data.get('kodosumi_fid') if result_data else None,
-            'mip003_schema': mip003_schema  # Include MIP003 schema for field names
+            'kodosumi_fid': result_data.get('kodosumi_fid') if isinstance(result_data, dict) else None,
+            'mip003_schema': mip003_schema,  # Include MIP003 schema for field names
+            'output_hash': compute_result_hash(result_data)
         }
         
         cursor.close()
@@ -611,28 +694,55 @@ def api_stats():
 def update_flow_agent(flow_id):
     """API endpoint to update flow agent identifier."""
     try:
-        data = request.get_json()
-        agent_identifier = data.get('agent_identifier', '').strip()
-        
+        data = request.get_json(silent=True) or {}
+        agent_default = (data.get('agent_identifier_default') or data.get('agent_identifier') or '').strip()
+        premium_agent = (data.get('premium_agent_identifier') or '').strip()
+        free_agent = (data.get('free_agent_identifier') or '').strip()
+        raw_free_flag = data.get('free_mode_enabled', False)
+        if isinstance(raw_free_flag, bool):
+            free_mode_enabled = raw_free_flag
+        elif isinstance(raw_free_flag, (int, float)):
+            free_mode_enabled = bool(raw_free_flag)
+        else:
+            free_mode_enabled = str(raw_free_flag).lower() in ['1', 'true', 'yes', 'on']
+
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # Update the agent_identifier for the flow
+
+        # Update the agent identifiers for the flow
         cursor.execute("""
             UPDATE flows 
-            SET agent_identifier = %s, updated_at = CURRENT_TIMESTAMP 
+            SET agent_identifier = %s,
+                agent_identifier_default = %s,
+                premium_agent_identifier = %s,
+                free_agent_identifier = %s,
+                free_mode_enabled = %s,
+                updated_at = CURRENT_TIMESTAMP 
             WHERE id = %s
-        """, (agent_identifier if agent_identifier else None, flow_id))
-        
+        """, (
+            agent_default or None,
+            agent_default or None,
+            premium_agent or None,
+            free_agent or None,
+            free_mode_enabled,
+            flow_id
+        ))
+
         if cursor.rowcount == 0:
             return jsonify({'error': 'Flow not found'}), 404
-        
+
         conn.commit()
         cursor.close()
         conn.close()
-        
-        return jsonify({'success': True, 'agent_identifier': agent_identifier})
-        
+
+        return jsonify({
+            'success': True,
+            'agent_identifier_default': agent_default,
+            'premium_agent_identifier': premium_agent,
+            'free_agent_identifier': free_agent,
+            'free_mode_enabled': free_mode_enabled
+        })
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -673,11 +783,10 @@ def get_container_logs(container_name):
             'kodosumi-authenticator',
             'kodosumi-flow-sync',
             'kodosumi-payment-checker',
-            'kodo-masu-connector-20-api-server-1',
-            'kodo-masu-connector-20-api-server-2',
-            'kodo-masu-connector-20-api-server-3',
+            'kodosumi-api-server',
+            'kodosumi-admin-dashboard',
             'kodosumi-postgres',
-            'kodosumi-nginx'
+            'kodosumi-pgadmin'
         ]
         
         if container_name not in allowed_containers:
@@ -695,7 +804,13 @@ def get_container_logs(container_name):
         cmd = ['docker', 'logs', '--tail', lines, container_name]
         app.logger.info(f"Running command: {' '.join(cmd)}")
         
-        result = subprocess.run(cmd, capture_output=True, text=True, stderr=subprocess.STDOUT)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False
+        )
         
         app.logger.info(f"Command return code: {result.returncode}")
         app.logger.info(f"Output length: {len(result.stdout)} characters")

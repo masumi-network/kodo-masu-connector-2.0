@@ -5,7 +5,10 @@ from contextlib import asynccontextmanager
 import logging
 import uvicorn
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
+from enum import Enum
+from urllib.parse import unquote
+import os
 import asyncio
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -28,6 +31,65 @@ from cache import flow_cache, response_cache, schema_cache, not_found_cache
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def _load_max_start_attempts() -> int:
+    value = os.getenv('KODOSUMI_START_MAX_ATTEMPTS', '10')
+    try:
+        attempts = int(value)
+    except ValueError:
+        logger.warning("Invalid KODOSUMI_START_MAX_ATTEMPTS value '%s', defaulting to 10", value)
+        attempts = 10
+    return max(1, attempts)
+
+MAX_START_ATTEMPTS = _load_max_start_attempts()
+
+
+class FlowVariant(str, Enum):
+    DEFAULT = "default"
+    PREMIUM = "premium"
+    FREE = "free"
+
+
+def parse_flow_identifier(identifier: str) -> Tuple[str, FlowVariant]:
+    """Split flow identifier into base identifier and variant."""
+    if not identifier:
+        return identifier, FlowVariant.DEFAULT
+
+    # Decode URL-encoded sequences (handle double-encoding by decoding twice if needed).
+    decoded = unquote(identifier)
+    if "%" in decoded:
+        decoded = unquote(decoded)
+
+    normalized = decoded.strip()
+    if normalized.lower().endswith("+premium"):
+        base = normalized[:-8]
+        return base if base else normalized, FlowVariant.PREMIUM
+    if normalized.lower().endswith("+free"):
+        base = normalized[:-5]
+        return base if base else normalized, FlowVariant.FREE
+    return normalized, FlowVariant.DEFAULT
+
+
+def resolve_agent_identifier(flow: Dict[str, Any], variant: FlowVariant) -> Tuple[Optional[str], bool]:
+    """Return the agent identifier for the requested variant and whether payment is required."""
+    default_agent = flow.get('agent_identifier_default') or flow.get('agent_identifier')
+
+    if variant == FlowVariant.DEFAULT:
+        return (default_agent.strip() if isinstance(default_agent, str) else None, True)
+
+    if variant == FlowVariant.PREMIUM:
+        premium_agent = flow.get('premium_agent_identifier')
+        return (premium_agent.strip() if isinstance(premium_agent, str) else None, True)
+
+    # Free variant
+    free_enabled = bool(flow.get('free_mode_enabled'))
+    free_agent = flow.get('free_agent_identifier')
+    if not free_enabled:
+        return None, False
+    if isinstance(free_agent, str) and free_agent.strip():
+        return free_agent.strip(), False
+    # Fallback to default agent when free mode is enabled but no dedicated identifier is set
+    return (default_agent.strip() if isinstance(default_agent, str) else None, False)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -129,11 +191,13 @@ async def start_job(
     Creates a payment request and stores job information in the database.
     """
     try:
+        base_identifier, variant = parse_flow_identifier(flow_identifier)
+
         # Get flow information from database (by UID or name)
-        flow = await db_manager.get_flow_by_uid_or_name(flow_identifier)
+        flow = await db_manager.get_flow_by_uid_or_name(base_identifier)
         if not flow:
-            raise HTTPException(status_code=404, detail=f"Flow '{flow_identifier}' not found")
-        
+            raise HTTPException(status_code=404, detail=f"Flow '{base_identifier}' not found")
+
         # Validate input data against MIP003 schema
         mip003_schema = flow.get('mip003_schema', [])
         if not mip003_schema:
@@ -156,90 +220,102 @@ async def start_job(
                 status_code=400,
                 detail=f"Invalid input data: {e.message}"
             )
-        
-        # Get agent identifier from flow
-        flow_agent_identifier = flow.get('agent_identifier')
-        
-        # Create payment request
-        try:
-            payment_response = await payment_service.create_payment_request(
-                identifier_from_purchaser=job_request.identifier_from_purchaser,
-                input_data=job_request.input_data,
-                agent_identifier=flow_agent_identifier
+
+        # Determine agent identifier and payment requirement based on variant
+        agent_identifier, payment_required = resolve_agent_identifier(flow, variant)
+
+        if not agent_identifier:
+            variant_name = variant.value
+            raise HTTPException(
+                status_code=404,
+                detail=f"Flow '{base_identifier}' does not have an agent configured for variant '{variant_name}'"
             )
-        except Exception as e:
-            logger.error(f"Payment request failed: {e}")
-            raise HTTPException(status_code=500, detail="Failed to create payment request")
-        
-        # Extract the actual payment data from the nested response structure
-        payment_data = payment_response.get("data", {}) if isinstance(payment_response, dict) else {}
-        
-        # Parse timestamp values (keep as milliseconds)
-        def parse_timestamp(timestamp_str: str) -> int:
-            try:
-                # Keep as milliseconds (original format)
-                return int(timestamp_str)
-            except:
-                return 0
-        
-        # Extract time values from the correct nested fields
-        submit_result_time = parse_timestamp(payment_data.get("submitResultTime", "0"))
-        unlock_time = parse_timestamp(payment_data.get("unlockTime", "0"))
-        external_dispute_unlock_time = parse_timestamp(payment_data.get("externalDisputeUnlockTime", "0"))
-        pay_by_time = parse_timestamp(payment_data.get("payByTime", "0"))
-        
-        # Use the same agent identifier that was used to create the payment
-        # This ensures consistency between payment creation and API response
-        agent_identifier = flow_agent_identifier or config.AGENT_IDENTIFIER
-        
-        # Extract wallet public key
-        smart_contract_wallet = payment_data.get("SmartContractWallet", {})
-        seller_vkey = smart_contract_wallet.get("walletVkey", "")
-        
-        # Extract amounts from RequestedFunds
-        requested_funds = payment_data.get("RequestedFunds", [])
+
         amounts_list = []
-        
-        for fund in requested_funds:
-            amount = int(fund.get("amount", 0))
-            
-            # Use different units based on network
-            if config.NETWORK.lower() == "preprod":
-                # Preprod uses empty string for lovelace/ADA
-                unit = ""
-            else:
-                # Mainnet uses USDM token identifier
-                unit = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d"
-            
-            logger.info(f"Network: {config.NETWORK}, Unit: '{unit}'")
-            amounts_list.append(Amount(amount=amount, unit=unit))
-        
-        # Store job in database (use the actual UID from the flow)
-        # Store the complete payment response for future reference
+        payment_response: Dict[str, Any] = {}
+        payment_data: Dict[str, Any] = {}
+        submit_result_time = unlock_time = external_dispute_unlock_time = pay_by_time = 0
+        seller_vkey = ""
+        blockchain_identifier = ""
+        input_hash_value: Optional[str] = None
+
+        if payment_required:
+            # Create payment request via Masumi
+            try:
+                payment_response = await payment_service.create_payment_request(
+                    identifier_from_purchaser=job_request.identifier_from_purchaser,
+                    input_data=job_request.input_data,
+                    agent_identifier=agent_identifier
+                )
+            except Exception as e:
+                logger.error(f"Payment request failed: {e}")
+                raise HTTPException(status_code=500, detail="Failed to create payment request")
+
+            payment_data = payment_response.get("data", {}) if isinstance(payment_response, dict) else {}
+
+            def parse_timestamp(timestamp_str: str) -> int:
+                try:
+                    return int(timestamp_str)
+                except Exception:
+                    return 0
+
+            submit_result_time = parse_timestamp(payment_data.get("submitResultTime", "0"))
+            unlock_time = parse_timestamp(payment_data.get("unlockTime", "0"))
+            external_dispute_unlock_time = parse_timestamp(payment_data.get("externalDisputeUnlockTime", "0"))
+            pay_by_time = parse_timestamp(payment_data.get("payByTime", "0"))
+            blockchain_identifier = payment_data.get("blockchainIdentifier", "")
+
+            smart_contract_wallet = payment_data.get("SmartContractWallet", {})
+            seller_vkey = smart_contract_wallet.get("walletVkey", "")
+
+            requested_funds = payment_data.get("RequestedFunds", [])
+            for fund in requested_funds:
+                amount = int(fund.get("amount", 0))
+
+                if config.NETWORK.lower() == "preprod":
+                    unit = ""
+                else:
+                    unit = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d"
+
+                logger.info(f"Network: {config.NETWORK}, Unit: '{unit}'")
+                amounts_list.append(Amount(amount=amount, unit=unit))
+
+            input_hash_value = payment_data.get("inputHash")
+        else:
+            logger.info(f"Creating free-mode job for flow {base_identifier}")
+
+        # Store job in database
         created_job_id = await db_manager.create_job(
-            flow_uid=flow["uid"],  # Always use the actual UID
+            flow_uid=flow["uid"],
             input_data=job_request.input_data,
-            payment_data=payment_response,  # Store the full response, not just data
-            identifier_from_purchaser=job_request.identifier_from_purchaser
+            payment_data=payment_response,
+            identifier_from_purchaser=job_request.identifier_from_purchaser,
+            status="awaiting_payment" if payment_required else "running",
+            input_hash=input_hash_value,
+            agent_identifier_used=agent_identifier,
+            payment_required=payment_required,
+            waiting_for_start=not payment_required  # free-mode jobs can start immediately
         )
-        
-        # Debug logging
-        logger.info(f"Created job_id: {created_job_id}, type: {type(created_job_id)}")
-        
-        # Update job with blockchain identifier
-        blockchain_identifier = payment_data.get("blockchainIdentifier", "")
-        await db_manager.update_job_status(
-            job_id=created_job_id,
-            status="awaiting_payment",
-            message=f"Payment requested. Blockchain ID: {blockchain_identifier}" if blockchain_identifier else "Payment requested"
-        )
-        
-        # Build response - ensure job_id is a string
+
+        # Update job status with message
+        if payment_required:
+            message = f"Payment requested. Blockchain ID: {blockchain_identifier}" if blockchain_identifier else "Payment requested"
+            await db_manager.update_job_status(
+                job_id=created_job_id,
+                status="awaiting_payment",
+                message=message,
+                waiting_for_start=False
+            )
+        else:
+            await db_manager.update_job_status(
+                job_id=created_job_id,
+                status="running",
+                message="Free job queued for execution",
+                waiting_for_start=True
+            )
+
         job_id_string = str(created_job_id)
-        
-        # Log the amounts before creating response
-        logger.info(f"Amounts list: {[{'amount': a.amount, 'unit': a.unit} for a in amounts_list]}")
-        
+
         response = StartJobResponse(
             status="success",
             job_id=job_id_string,
@@ -252,10 +328,13 @@ async def start_job(
             sellerVKey=seller_vkey,
             identifierFromPurchaser=job_request.identifier_from_purchaser,
             amounts=amounts_list,
-            input_hash=payment_data.get("inputHash", "")
+            input_hash=input_hash_value or ""
         )
-        
-        logger.info(f"Job {created_job_id} started successfully for flow {flow_identifier} (UID: {flow['uid']})")
+
+        logger.info(
+            f"Job {created_job_id} started successfully for flow {base_identifier}"
+            f" (UID: {flow['uid']}), variant={variant.value}, payment_required={payment_required}"
+        )
         return response
         
     except HTTPException:
@@ -273,12 +352,13 @@ async def check_job_status(
 ):
     """Check the status of a specific job with caching."""
     try:
+        base_identifier, _ = parse_flow_identifier(flow_identifier)
         # Check regular cache first for successful responses
-        cache_key = f"{flow_identifier}:{job_id}"
+        cache_key = f"{base_identifier}:{job_id}"
         cached_response = await response_cache.get("status", {"key": cache_key})
         if cached_response:
             return cached_response
-        
+
         # Check not-found cache for 404 responses
         not_found_response = await not_found_cache.get("not_found", {"key": cache_key})
         if not_found_response:
@@ -286,13 +366,13 @@ async def check_job_status(
             raise HTTPException(status_code=404, detail=not_found_response.get('message', 'Not found'))
         
         # Get flow information to verify it exists and get actual UID
-        flow = await db_manager.get_flow_by_uid_or_name(flow_identifier)
+        flow = await db_manager.get_flow_by_uid_or_name(base_identifier)
         if not flow:
             # Cache the flow not found error
             await not_found_cache.set("not_found", {"key": cache_key}, {
-                'message': f"Flow '{flow_identifier}' not found"
+                'message': f"Flow '{base_identifier}' not found"
             })
-            raise HTTPException(status_code=404, detail=f"Flow '{flow_identifier}' not found")
+            raise HTTPException(status_code=404, detail=f"Flow '{base_identifier}' not found")
         
         # Get job from database
         job = await db_manager.get_job_by_id(job_id)
@@ -314,9 +394,11 @@ async def check_job_status(
         # Build status response
         # Check if this is a job that failed to start in Kodosumi
         # Jobs with status "error" and waiting_for_start_in_kodosumi=true failed to start
-        if (job["status"] == "error" and 
-            job.get("waiting_for_start_in_kodosumi", False) and 
-            job.get("kodosumi_start_attempts", 0) >= 5):
+        if (
+            job["status"] == "error"
+            and job.get("waiting_for_start_in_kodosumi", False)
+            and job.get("kodosumi_start_attempts", 0) >= MAX_START_ATTEMPTS
+        ):
             # This job failed to start in Kodosumi after max attempts
             response = StatusResponse(
                 job_id=job_id,
@@ -398,11 +480,16 @@ async def provide_input(
 ):
     """Provide additional input for a job awaiting input."""
     try:
+        base_identifier, variant = parse_flow_identifier(flow_identifier)
         # Get flow information to verify it exists and get actual UID
-        flow = await db_manager.get_flow_by_uid_or_name(flow_identifier)
+        flow = await db_manager.get_flow_by_uid_or_name(base_identifier)
         if not flow:
-            raise HTTPException(status_code=404, detail=f"Flow '{flow_identifier}' not found")
-        
+            raise HTTPException(status_code=404, detail=f"Flow '{base_identifier}' not found")
+
+        agent_identifier, _ = resolve_agent_identifier(flow, variant)
+        if not agent_identifier:
+            raise HTTPException(status_code=404, detail="Variant not available for this flow")
+
         # Get job from database
         job = await db_manager.get_job_by_id(input_request.job_id)
         if not job:
@@ -442,12 +529,21 @@ async def check_availability(
     request: Request = None
 ):
     """Check if the server and specific flow are available - ALWAYS returns available."""
-    # Ultra-lightweight implementation - no database calls, no caching
-    # Just return available immediately for maximum performance
+    base_identifier, variant = parse_flow_identifier(flow_identifier)
+    flow = await db_manager.get_flow_by_uid_or_name(base_identifier)
+    if not flow:
+        raise HTTPException(status_code=404, detail=f"Flow '{base_identifier}' not found")
+
+    agent_identifier, _ = resolve_agent_identifier(flow, variant)
+    if not agent_identifier:
+        raise HTTPException(status_code=404, detail="Variant not available for this flow")
+
+    variant_suffix = "" if variant == FlowVariant.DEFAULT else f" ({variant.value})"
+
     return AvailabilityResponse(
         status="available",
         type="masumi-agent",
-        message=f"Flow '{flow_identifier}' is ready to accept jobs"
+        message=f"Flow '{base_identifier}{variant_suffix}' is ready to accept jobs"
     )
 
 @app.get("/{flow_identifier}/input_schema", response_model=InputSchemaResponse)
@@ -458,28 +554,31 @@ async def get_input_schema(
 ):
     """Get the input schema for the specified flow with caching."""
     try:
-        # Check cache first (use schema_cache with longer TTL)
-        cached_response = await schema_cache.get("input_schema", {"flow_identifier": flow_identifier})
+        base_identifier, variant = parse_flow_identifier(flow_identifier)
+        # Get flow from database (by UID or name)
+        flow = await db_manager.get_flow_by_uid_or_name(base_identifier)
+        if not flow:
+            raise HTTPException(status_code=404, detail=f"Flow '{base_identifier}' not found")
+
+        agent_identifier, _ = resolve_agent_identifier(flow, variant)
+        if not agent_identifier:
+            raise HTTPException(status_code=404, detail="Variant not available for this flow")
+
+        # Check cache after validating the variant
+        cached_response = await schema_cache.get("input_schema", {"flow_identifier": base_identifier})
         if cached_response:
             # Create a deep copy to avoid modifying cached data
             import copy
             response_copy = copy.deepcopy(cached_response)
-            # Ensure validations is always an array
             if 'input_data' in response_copy:
                 for field in response_copy['input_data']:
                     if 'validations' in field and field['validations'] is None:
                         field['validations'] = []
                     elif 'validations' not in field:
                         field['validations'] = []
-            # Use Response with manual JSON to ensure arrays stay as arrays
             import json
             json_str = json.dumps(response_copy)
             return Response(content=json_str, media_type="application/json")
-        
-        # Get flow from database (by UID or name)
-        flow = await db_manager.get_flow_by_uid_or_name(flow_identifier)
-        if not flow:
-            raise HTTPException(status_code=404, detail=f"Flow '{flow_identifier}' not found")
         
         # Get MIP003 schema
         mip003_schema = flow.get('mip003_schema', [])
@@ -509,7 +608,7 @@ async def get_input_schema(
         response_data = {"input_data": cleaned_schema}
         
         # Cache the response for 10 minutes (schemas rarely change)
-        await schema_cache.set("input_schema", {"flow_identifier": flow_identifier}, response_data)
+        await schema_cache.set("input_schema", {"flow_identifier": base_identifier}, response_data)
         
         # Use Response with manual JSON to ensure arrays stay as arrays
         import json

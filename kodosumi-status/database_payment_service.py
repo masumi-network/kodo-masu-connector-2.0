@@ -99,8 +99,9 @@ class DatabasePaymentService:
             logger.info(f"  - Agent: {job['agent_identifier'][:20]}...")
             
             # Create payment instance
+            agent_identifier = job.get('agent_identifier')
             payment = Payment(
-                agent_identifier=job['agent_identifier'],
+                agent_identifier=agent_identifier,
                 config=masumi_config,
                 network=payment_config['network'],
                 identifier_from_purchaser=job['identifier_from_purchaser'],

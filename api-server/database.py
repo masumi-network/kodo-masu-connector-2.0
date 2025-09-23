@@ -107,23 +107,33 @@ class DatabaseManager:
     
     async def create_job(self, flow_uid: str, input_data: Dict[str, Any], 
                         payment_data: Dict[str, Any], 
-                        identifier_from_purchaser: str) -> str:
+                        identifier_from_purchaser: str,
+                        *,
+                        status: str = "awaiting_payment",
+                        input_hash: Optional[str] = None,
+                        agent_identifier_used: Optional[str] = None,
+                        payment_required: bool = True,
+                        waiting_for_start: bool = False) -> str:
         """Create a new job record and return the job_id."""
         async with self._pool.acquire() as conn:
             job_id = await conn.fetchval(
                 """
                 INSERT INTO jobs (
-                    flow_uid, input_data, payment_data, 
-                    identifier_from_purchaser, status, input_hash
-                ) VALUES ($1, $2, $3, $4, $5, $6)
+                    flow_uid, input_data, payment_data,
+                    identifier_from_purchaser, status, input_hash,
+                    agent_identifier_used, payment_required, waiting_for_start_in_kodosumi
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING job_id
                 """,
                 flow_uid,
                 json.dumps(input_data),
-                json.dumps(payment_data),
+                json.dumps(payment_data or {}),
                 identifier_from_purchaser,
-                "awaiting_payment",
-                payment_data.get("input_hash")
+                status,
+                input_hash,
+                agent_identifier_used,
+                payment_required,
+                waiting_for_start
             )
             # Convert UUID to string since asyncpg returns UUID objects
             return str(job_id)
@@ -150,26 +160,31 @@ class DatabaseManager:
     async def update_job_status(self, job_id: str, status: str, 
                                result: Optional[Dict[str, Any]] = None,
                                message: Optional[str] = None,
-                               reasoning: Optional[str] = None):
-        """Update job status and optionally result, message, and reasoning."""
+                               reasoning: Optional[str] = None,
+                               waiting_for_start: Optional[bool] = None):
+        """Update job status and optionally result, message, reasoning, and waiting flag."""
         async with self._pool.acquire() as conn:
             if result:
                 await conn.execute(
                     """
                     UPDATE jobs 
-                    SET status = $1, result = $2, message = $3, reasoning = $4, updated_at = CURRENT_TIMESTAMP
-                    WHERE job_id = $5
+                    SET status = $1, result = $2, message = $3, reasoning = $4,
+                        waiting_for_start_in_kodosumi = COALESCE($5, waiting_for_start_in_kodosumi),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE job_id = $6
                     """,
-                    status, json.dumps(result), message, reasoning, job_id
+                    status, json.dumps(result), message, reasoning, waiting_for_start, job_id
                 )
             else:
                 await conn.execute(
                     """
                     UPDATE jobs 
-                    SET status = $1, message = $2, reasoning = $3, updated_at = CURRENT_TIMESTAMP
-                    WHERE job_id = $4
+                    SET status = $1, message = $2, reasoning = $3,
+                        waiting_for_start_in_kodosumi = COALESCE($4, waiting_for_start_in_kodosumi),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE job_id = $5
                     """,
-                    status, message, reasoning, job_id
+                    status, message, reasoning, waiting_for_start, job_id
                 )
 
     async def get_pool_stats(self) -> Dict[str, Any]:
