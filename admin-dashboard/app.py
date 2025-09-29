@@ -800,9 +800,45 @@ def get_container_logs(container_name):
         except:
             lines = '100'
         
+        # Determine the actual container name (Compose may prepend hashes/project prefixes)
+        requested_container = container_name
+        resolved_container = None
+
+        ps_result = subprocess.run(
+            ['docker', 'ps', '--format', '{{.Names}}'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False
+        )
+
+        if ps_result.returncode == 0:
+            available_containers = [name.strip() for name in ps_result.stdout.split('\n') if name.strip()]
+
+            def _match_container(predicate):
+                return next((name for name in available_containers if predicate(name)), None)
+
+            matchers = [
+                lambda name: name == requested_container,
+                lambda name: name.endswith(f'_{requested_container}'),
+                lambda name: name.endswith(f'-{requested_container}'),
+                lambda name: requested_container in name,
+            ]
+
+            for matcher in matchers:
+                resolved_container = _match_container(matcher)
+                if resolved_container:
+                    break
+        else:
+            app.logger.error(f"[LOGS API] docker ps failed: {ps_result.stderr}")
+
+        if not resolved_container:
+            app.logger.error(f"[LOGS API] Container not running: {requested_container}")
+            return jsonify({'error': f'Container {requested_container} is not running'}), 404
+
         # Get logs from Docker
-        cmd = ['docker', 'logs', '--tail', lines, container_name]
-        app.logger.info(f"Running command: {' '.join(cmd)}")
+        cmd = ['docker', 'logs', '--tail', lines, resolved_container]
+        app.logger.info(f"Running command: {' '.join(cmd)} (requested: {requested_container})")
         
         result = subprocess.run(
             cmd,
@@ -823,7 +859,8 @@ def get_container_logs(container_name):
         log_lines = result.stdout.strip().split('\n')
         
         return jsonify({
-            'container': container_name,
+            'container': requested_container,
+            'resolved_container': resolved_container,
             'logs': log_lines,
             'line_count': len(log_lines)
         })

@@ -1,5 +1,16 @@
 # Available Kodosumi Agents
 
+## Quick Setup
+
+For a clean installation (local laptop, new VM, CI runner, etc.) all services and the database bootstrap with a single command:
+
+```bash
+cp .env.example .env              # update secrets as needed
+docker compose up -d --build      # or bash startup.sh
+```
+
+`database/init.sql` now contains the full schema (flows/job columns, cron history, constraints), so no extra migration step is required on fresh machines. The authenticator seeds an API key on first boot and the flow-sync job automatically populates the catalog once the key is available. For upgrades of an existing deployment, keep using `./scripts/apply_migrations.sh` to layer any new changes on top of live data.
+
 The table below reflects the flows currently synced into the connector (last refreshed via `flow-sync` on the current environment). Endpoints are taken directly from the upstream Kodosumi catalog; if the host portion is `0.0.0.0` you will need to replace it with a routable hostname/IP before the starter can reach it.
 
 | Flow | UID | Kodosumi Path | URL Identifier |

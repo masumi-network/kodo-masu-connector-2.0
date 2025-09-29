@@ -51,6 +51,11 @@ CREATE TRIGGER update_flows_updated_at BEFORE UPDATE
 CREATE INDEX IF NOT EXISTS idx_flows_uid ON flows(uid);
 CREATE INDEX IF NOT EXISTS idx_flows_author ON flows(author);
 CREATE INDEX IF NOT EXISTS idx_flows_updated_at ON flows(updated_at);
+CREATE INDEX IF NOT EXISTS idx_flows_agent_identifier ON flows(agent_identifier);
+
+-- Ensure flow names remain unique for upsert logic
+ALTER TABLE flows
+    ADD CONSTRAINT flows_summary_unique UNIQUE (summary);
 
 -- Create the jobs table for tracking MIP003 job execution
 CREATE TABLE IF NOT EXISTS jobs (
@@ -86,3 +91,29 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_identifier_from_purchaser ON jobs(identifier_from_purchaser);
 CREATE INDEX IF NOT EXISTS idx_jobs_blockchain_identifier ON jobs(blockchain_identifier);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_waiting_for_start ON jobs(waiting_for_start_in_kodosumi) WHERE waiting_for_start_in_kodosumi = true;
+CREATE INDEX IF NOT EXISTS idx_jobs_kodosumi_attempts ON jobs(kodosumi_start_attempts);
+
+-- Track cron job executions for dashboard visibility
+CREATE TABLE IF NOT EXISTS cron_executions (
+    id SERIAL PRIMARY KEY,
+    service_name VARCHAR(100) NOT NULL,
+    execution_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR(20) DEFAULT 'started',
+    items_processed INTEGER DEFAULT 0,
+    error_message TEXT,
+    duration_ms INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_cron_executions_service_time ON cron_executions (service_name, execution_time DESC);
+
+INSERT INTO cron_executions (service_name, status, items_processed)
+SELECT label, 'completed', 0
+FROM (VALUES
+    ('authenticator'),
+    ('flow-sync'),
+    ('payment-checker'),
+    ('kodosumi-starter'),
+    ('kodosumi-status')
+) AS services(label)
+ON CONFLICT DO NOTHING;
