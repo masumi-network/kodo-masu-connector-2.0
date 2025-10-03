@@ -15,7 +15,8 @@ import logging
 import os
 import json
 import sys
-from typing import List, Dict, Any, Optional
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
 from database_payment_service import DatabasePaymentService
 
@@ -31,6 +32,11 @@ logger = logging.getLogger(__name__)
 
 # Payment service is now available through database configuration
 PAYMENT_SERVICE_AVAILABLE = True
+
+# Retry configuration
+MAX_TIMEOUT_ATTEMPTS = 20
+MAX_NOT_FOUND_ATTEMPTS = 20
+FINAL_RETRY_DELAY = timedelta(hours=1)
 
 class KodosumiStatusChecker:
     """Service for checking status of jobs in Kodosumi."""
@@ -70,7 +76,7 @@ class KodosumiStatusChecker:
     
     async def get_running_jobs_with_fid(self, conn: asyncpg.Connection) -> List[Dict[str, Any]]:
         """Get all jobs that are running and have a Kodosumi FID."""
-        query = """
+        query = f"""
             SELECT j.job_id, j.flow_uid, j.status, 
                    j.result->>'kodosumi_fid' as kodosumi_fid,
                    j.payment_data, j.input_data, j.identifier_from_purchaser,
@@ -82,8 +88,8 @@ class KodosumiStatusChecker:
             LEFT JOIN flows f ON j.flow_uid = f.uid
             WHERE j.status = 'running' 
               AND j.result->>'kodosumi_fid' IS NOT NULL
-              AND j.timeout_attempts < 3
-              AND j.not_found_attempts < 3
+              AND j.timeout_attempts <= {MAX_TIMEOUT_ATTEMPTS}
+              AND j.not_found_attempts <= {MAX_NOT_FOUND_ATTEMPTS}
             ORDER BY j.created_at ASC
         """
         
@@ -165,12 +171,22 @@ class KodosumiStatusChecker:
     async def update_completed_job(self, conn: asyncpg.Connection, job_id: str, final_result: str) -> bool:
         """Update a job that has completed in Kodosumi."""
         try:
+            sanitized_result = final_result.replace('\x00', '') if final_result else final_result
+            if sanitized_result != final_result:
+                logger.warning(f"Removed null bytes from final result for job {job_id}")
+            final_result = sanitized_result
+            logger.debug(f"Final result preview for job {job_id}: {final_result.encode('unicode_escape')[:200]}")
             # Parse the final result to store it properly
             try:
                 final_data = json.loads(final_result)
             except json.JSONDecodeError:
                 # If it's not valid JSON, store it as a string in a wrapper object
                 final_data = {"raw_result": final_result}
+
+            cleaned_data, removed = self._strip_null_bytes(final_data)
+            if removed:
+                logger.warning(f"Removed {removed} null byte occurrences while storing job {job_id} result")
+            final_data = cleaned_data
             
             query = """
                 UPDATE jobs 
@@ -250,6 +266,33 @@ class KodosumiStatusChecker:
         
         # Fallback to direct access (old format)
         return payment_data.get('blockchainIdentifier')
+
+    def _strip_null_bytes(self, value: Any) -> Tuple[Any, int]:
+        """Recursively remove null bytes from strings within nested structures."""
+        removed = 0
+
+        if isinstance(value, str):
+            cleaned = value.replace('\x00', '')
+            removed = len(value) - len(cleaned)
+            return cleaned, removed
+
+        if isinstance(value, list):
+            cleaned_list = []
+            for item in value:
+                cleaned_item, item_removed = self._strip_null_bytes(item)
+                removed += item_removed
+                cleaned_list.append(cleaned_item)
+            return cleaned_list, removed
+
+        if isinstance(value, dict):
+            cleaned_dict = {}
+            for key, item in value.items():
+                cleaned_item, item_removed = self._strip_null_bytes(item)
+                removed += item_removed
+                cleaned_dict[key] = cleaned_item
+            return cleaned_dict, removed
+
+        return value, 0
     
     async def submit_result_to_masumi(self, job: Dict[str, Any], final_result: str, api_key: str):
         """Submit job result to Masumi for payment completion."""
@@ -307,12 +350,45 @@ class KodosumiStatusChecker:
             
             # Check status for each job
             for job in running_jobs:
-                jobs_processed += 1  # Count each job checked
                 job_id = str(job['job_id'])
                 fid = job['kodosumi_fid']
-                
+                timeout_attempts = job.get('timeout_attempts', 0) or 0
+                not_found_attempts = job.get('not_found_attempts', 0) or 0
+                last_update = job.get('updated_at')
+
+                # Determine whether we should delay further retries for this job
+                now_utc = datetime.utcnow()
+
+                if timeout_attempts >= MAX_TIMEOUT_ATTEMPTS:
+                    if timeout_attempts == MAX_TIMEOUT_ATTEMPTS and last_update:
+                        retry_after = last_update + FINAL_RETRY_DELAY
+                        if now_utc < retry_after:
+                            logger.info(
+                                f"Job {job_id} hit {timeout_attempts} timeouts - waiting until "
+                                f"{retry_after.isoformat()} before final retry"
+                            )
+                            continue
+                    else:
+                        # Should not happen because job is marked failed once attempts exceed max
+                        logger.debug(f"Skipping job {job_id} with timeout attempts {timeout_attempts}")
+                        continue
+
+                if not_found_attempts >= MAX_NOT_FOUND_ATTEMPTS:
+                    if not_found_attempts == MAX_NOT_FOUND_ATTEMPTS and last_update:
+                        retry_after = last_update + FINAL_RETRY_DELAY
+                        if now_utc < retry_after:
+                            logger.info(
+                                f"Job {job_id} hit {not_found_attempts} 404s - waiting until "
+                                f"{retry_after.isoformat()} before final retry"
+                            )
+                            continue
+                    else:
+                        logger.debug(f"Skipping job {job_id} with not_found_attempts {not_found_attempts}")
+                        continue
+
                 logger.info(f"Checking status for job {job_id} (FID: {fid})")
-                
+                jobs_processed += 1  # Only count attempts where we actually make a request
+
                 # Check job status in Kodosumi
                 status_result = await self.check_job_status(fid, kodosumi_api_key)
                 
@@ -321,9 +397,11 @@ class KodosumiStatusChecker:
                     if status_result.get('timeout'):
                         logger.warning(f"Job {job_id} timed out - incrementing timeout attempts")
                         await self.increment_timeout_attempts(conn, job_id)
-                        timeout_attempts = job.get('timeout_attempts', 0) + 1
-                        if timeout_attempts >= 3:
-                            logger.error(f"Job {job_id} has timed out {timeout_attempts} times - marking as failed")
+                        timeout_attempts = (job.get('timeout_attempts', 0) or 0) + 1
+                        if timeout_attempts >= MAX_TIMEOUT_ATTEMPTS + 1:
+                            logger.error(
+                                f"Job {job_id} has timed out {timeout_attempts} times - marking as failed"
+                            )
                             # Mark job as failed after 3 timeouts
                             await conn.execute(
                                 "UPDATE jobs SET status = 'failed', message = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2::uuid",
@@ -331,6 +409,15 @@ class KodosumiStatusChecker:
                                 job_id
                             )
                             jobs_processed += 1
+                        elif timeout_attempts == MAX_TIMEOUT_ATTEMPTS:
+                            logger.warning(
+                                f"Job {job_id} reached {MAX_TIMEOUT_ATTEMPTS} timeouts - scheduling final retry after "
+                                f"{FINAL_RETRY_DELAY}"
+                            )
+                        else:
+                            logger.info(
+                                f"Job {job_id} timed out (attempt {timeout_attempts}/{MAX_TIMEOUT_ATTEMPTS}) - will retry later"
+                            )
                         continue
                     
                     # Check if this was an error response
@@ -342,9 +429,11 @@ class KodosumiStatusChecker:
                             # Job not found in Kodosumi - increment attempts and retry
                             logger.warning(f"Job {job_id} not found in Kodosumi (404) - incrementing not_found_attempts")
                             await self.increment_not_found_attempts(conn, job_id)
-                            not_found_attempts = job.get('not_found_attempts', 0) + 1
-                            if not_found_attempts >= 3:
-                                logger.error(f"Job {job_id} not found after {not_found_attempts} attempts - marking as failed")
+                            not_found_attempts = (job.get('not_found_attempts', 0) or 0) + 1
+                            if not_found_attempts >= MAX_NOT_FOUND_ATTEMPTS + 1:
+                                logger.error(
+                                    f"Job {job_id} not found after {not_found_attempts} attempts - marking as failed"
+                                )
                                 # Mark job as failed after 3 404 attempts
                                 await conn.execute(
                                     "UPDATE jobs SET status = 'failed', message = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2::uuid",
@@ -353,7 +442,15 @@ class KodosumiStatusChecker:
                                 )
                                 jobs_processed += 1
                             else:
-                                logger.info(f"Job {job_id} not found (attempt {not_found_attempts}/3), will retry later")
+                                if not_found_attempts == MAX_NOT_FOUND_ATTEMPTS:
+                                    logger.warning(
+                                        f"Job {job_id} reached {MAX_NOT_FOUND_ATTEMPTS} not_found attempts - scheduling final retry after "
+                                        f"{FINAL_RETRY_DELAY}"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"Job {job_id} not found (attempt {not_found_attempts}/{MAX_NOT_FOUND_ATTEMPTS}) - will retry later"
+                                    )
                             continue
                         elif error_type == 'client_error':
                             # Client error - also mark as failed as it won't resolve
