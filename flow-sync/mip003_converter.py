@@ -18,15 +18,15 @@ class MIP003Converter:
         """Initialize the converter with mapping configurations."""
         self.type_mapping = {
             'text': 'string',
-            'password': 'string',
+            'password': 'password',
             'number': 'number',
             'textarea': 'textarea',
-            'date': 'string',
-            'time': 'string',
-            'datetime-local': 'string',
+            'date': 'date',
+            'time': 'time',
+            'datetime-local': 'datetime',
             'boolean': 'boolean',
             'select': 'option',
-            'checkbox': 'boolean'
+            'checkbox': 'checkbox'
         }
     
     def convert_schema(self, kodosumi_schema: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -105,6 +105,14 @@ class MIP003Converter:
         if element.get('placeholder'):
             data['placeholder'] = element['placeholder']
         
+        # Add description if provided
+        if element.get('description'):
+            data['description'] = element['description']
+        
+        # Add default value if provided (supports falsy values like 0 or False)
+        if element.get('value') is not None:
+            data['default'] = element.get('value')
+        
         # Handle select options
         if element.get('type') == 'select' and element.get('option'):
             values = []
@@ -123,10 +131,10 @@ class MIP003Converter:
             if values:
                 data['values'] = values
         
-        # Handle checkbox options
+        # Handle checkbox description fallback
         elif element.get('type') == 'checkbox' and element.get('option'):
-            # For checkboxes, the option text can serve as placeholder
-            data['placeholder'] = element.get('option', '')
+            # Use checkbox option text as description if none provided
+            data.setdefault('description', element.get('option', ''))
     
     def _add_validations(self, element: Dict[str, Any], mip003_element: Dict[str, Any]):
         """
