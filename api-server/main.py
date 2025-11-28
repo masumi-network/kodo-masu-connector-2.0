@@ -25,7 +25,7 @@ from models import (
     Amount, FlowListResponse, FlowInfo
 )
 from middleware import (
-    RobustnessMiddleware, HealthCheckMiddleware, 
+    RobustnessMiddleware,
     setup_rate_limiting, metrics_endpoint, limiter
 )
 from cache import flow_cache, response_cache, schema_cache, not_found_cache
@@ -136,7 +136,6 @@ app = FastAPI(
 rate_limits = setup_rate_limiting(app)
 
 # Add middlewares
-app.add_middleware(HealthCheckMiddleware)  # Process health checks first
 app.add_middleware(RobustnessMiddleware, request_timeout=30.0)
 app.add_middleware(
     CORSMiddleware,

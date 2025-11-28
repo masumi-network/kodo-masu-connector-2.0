@@ -83,15 +83,8 @@ class HealthCheckMiddleware:
             # Use cached response if available
             current_time = time.time()
             if self._health_cache and (current_time - self._cache_time) < self._cache_duration:
-                await send({
-                    'type': 'http.response.start',
-                    'status': 200,
-                    'headers': [[b'content-type', b'application/json']],
-                })
-                await send({
-                    'type': 'http.response.body',
-                    'body': self._health_cache,
-                })
+                response = Response(content=self._health_cache, media_type="application/json")
+                await response(scope, receive, send)
                 return
             
             # Generate new response
@@ -102,21 +95,15 @@ class HealthCheckMiddleware:
                 "timestamp": datetime.utcnow().isoformat()
             }
             import json
-            self._health_cache = json.dumps(response_data).encode()
+            self._health_cache = json.dumps(response_data)
             self._cache_time = current_time
             
             # Record health check duration
             health_check_duration.observe(time.time() - start_time)
             
-            await send({
-                'type': 'http.response.start',
-                'status': 200,
-                'headers': [[b'content-type', b'application/json']],
-            })
-            await send({
-                'type': 'http.response.body',
-                'body': self._health_cache,
-            })
+            response = Response(content=self._health_cache, media_type="application/json")
+            await response(scope, receive, send)
+            return
         else:
             await self.app(scope, receive, send)
 
