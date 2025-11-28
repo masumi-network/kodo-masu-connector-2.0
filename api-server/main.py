@@ -485,7 +485,6 @@ async def check_job_status(
                 raise
         
         if input_fields:
-            response.input_data = input_fields
             response.input_schema = input_schema_response
         
         # Cache response if job is completed or failed (won't change anymore)
