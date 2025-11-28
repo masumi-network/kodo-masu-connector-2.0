@@ -1,8 +1,9 @@
 from masumi.payment import Payment
 from masumi.config import Config as MasumiConfig
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 import logging
 import asyncio
+import json
 from config import config
 from circuit_breaker import PaymentServiceCircuitBreaker
 
@@ -66,7 +67,7 @@ class PaymentService:
             raise
     
     async def complete_payment(self, blockchain_identifier: str, 
-                             job_output: Dict[str, Any],
+                             job_output: Union[str, Dict[str, Any]],
                              identifier_from_purchaser: str,
                              input_data: Dict[str, Any],
                              agent_identifier: Optional[str] = None) -> Dict[str, Any]:
@@ -96,10 +97,13 @@ class PaymentService:
                 input_data=input_data
             )
             
+            # Reduce the job output to the same string we expose via /status
+            result_text = self._normalise_result(job_output)
+
             # Complete the payment with circuit breaker and timeout
             async def _complete_payment():
                 return await asyncio.wait_for(
-                    payment.complete_payment(blockchain_identifier, job_output),
+                    payment.complete_payment(blockchain_identifier, result_text),
                     timeout=self.timeout
                 )
             
@@ -111,6 +115,34 @@ class PaymentService:
         except Exception as e:
             logger.error(f"Failed to complete payment: {e}")
             raise
+
+    def _normalise_result(self, job_output: Union[str, Dict[str, Any]]) -> str:
+        """Mirror StatusResponse formatting so Masumi receives the same string clients see."""
+        if job_output is None:
+            return ""
+
+        if isinstance(job_output, str):
+            cleaned = job_output.replace('\x00', '')
+            if cleaned != job_output:
+                logger.warning("Stripped null bytes from job output before completing payment")
+            job_output = cleaned
+            try:
+                parsed = json.loads(job_output)
+            except json.JSONDecodeError:
+                return job_output
+            return self._normalise_result(parsed)
+
+        if isinstance(job_output, dict):
+            final_result = job_output.get("final_result")
+            if isinstance(final_result, dict):
+                markdown = final_result.get("Markdown")
+                if isinstance(markdown, dict):
+                    return markdown.get("body", "") or ""
+                return json.dumps(final_result)
+            return json.dumps(job_output)
+
+        # Lists or other types – return JSON string
+        return json.dumps(job_output)
 
     def get_circuit_breaker_status(self) -> Dict[str, Any]:
         """Get the current status of the circuit breaker."""

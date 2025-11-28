@@ -79,13 +79,10 @@ class DatabasePaymentService:
             if not blockchain_identifier:
                 logger.warning(f"Job {job_id} has no blockchain identifier, cannot complete payment")
                 return None
-            
-            # Parse the final result
-            try:
-                result_data = json.loads(final_result)
-            except json.JSONDecodeError:
-                result_data = {"result": final_result}
-            
+
+            # Trim the result down to the same string we expose via /status
+            result_text = DatabasePaymentService._extract_result_string(final_result)
+
             # Create Masumi config
             masumi_config = MasumiConfig(
                 payment_service_url=payment_config['payment_service_url'],
@@ -109,7 +106,7 @@ class DatabasePaymentService:
             )
             
             # Complete the payment
-            response = await payment.complete_payment(blockchain_identifier, result_data)
+            response = await payment.complete_payment(blockchain_identifier, result_text)
             
             logger.info(f"Successfully completed payment for job {job_id}. Response: {response}")
             return response
@@ -128,3 +125,34 @@ class DatabasePaymentService:
         
         # Fallback to direct access (old format)
         return payment_data.get('blockchainIdentifier')
+
+    @staticmethod
+    def _extract_result_string(final_result: str) -> str:
+        """Convert a raw Kodosumi final result payload to the display string used by /status."""
+        if not final_result:
+            return ""
+
+        cleaned = final_result.replace('\x00', '')
+        if cleaned != final_result:
+            logger.warning("Stripped null bytes from final result before completing payment")
+        final_result = cleaned
+
+        try:
+            parsed = json.loads(final_result)
+        except json.JSONDecodeError:
+            return final_result
+
+        # Final result is typically a dict; mirror the API's formatting rules
+        if isinstance(parsed, dict):
+            inner = parsed.get('final_result')
+            if isinstance(inner, dict):
+                markdown = inner.get('Markdown')
+                if isinstance(markdown, dict):
+                    return markdown.get('body', '') or ''
+                # If structure differs, fall back to JSON string of the inner payload
+                return json.dumps(inner)
+            # No nested final_result structure – return full dict as JSON string
+            return json.dumps(parsed)
+
+        # For lists or other JSON types, return serialized form
+        return json.dumps(parsed)

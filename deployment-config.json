@@ -1,0 +1,9 @@
+{
+  "deployment_type": "scaled",
+  "api_instances": 3,
+  "workers_per_instance": 16,
+  "total_workers": 48,
+  "load_balancer": "nginx",
+  "monitoring": "prometheus_metrics",
+  "deployed_at": "2025-07-17T16:54:56Z"
+}

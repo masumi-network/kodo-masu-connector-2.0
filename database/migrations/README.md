@@ -32,5 +32,6 @@ Migration files should be named with a numeric prefix to ensure they run in the 
 4. **004_add_summary_unique_constraint.sql** - Enforces unique flow summaries and deduplicates legacy data
 5. **005_add_flow_agent_columns.sql** - Adds agent metadata columns to `flows`
 6. **006_add_agent_identifier_used.sql** - Adds `agent_identifier_used` column to `jobs`
+7. **007_add_payment_required.sql** - Aligns existing databases with the new `payment_required` flag on `jobs`
 
 These remain available so upgrades retain historical data, but greenfield deployments do not need to run them manually.

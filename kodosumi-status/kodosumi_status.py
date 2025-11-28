@@ -36,7 +36,7 @@ PAYMENT_SERVICE_AVAILABLE = True
 # Retry configuration
 MAX_TIMEOUT_ATTEMPTS = 20
 MAX_NOT_FOUND_ATTEMPTS = 20
-FINAL_RETRY_DELAY = timedelta(hours=1)
+FINAL_RETRY_DELAY = timedelta(minutes=30)
 
 class KodosumiStatusChecker:
     """Service for checking status of jobs in Kodosumi."""
