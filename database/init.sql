@@ -1,3 +1,6 @@
+-- Ensure pgcrypto is available for UUID generation
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- Create the API keys table
 CREATE TABLE IF NOT EXISTS api_keys (
     id SERIAL PRIMARY KEY,
@@ -17,6 +20,23 @@ $$ language 'plpgsql';
 
 CREATE TRIGGER update_api_keys_updated_at BEFORE UPDATE
     ON api_keys FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Specialized trigger for jobs to maintain status identifiers
+CREATE OR REPLACE FUNCTION update_job_metadata()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (NEW.current_status_id IS NULL OR NEW.current_status_id = OLD.current_status_id) THEN
+        IF NEW.status IS DISTINCT FROM OLD.status
+            OR NEW.message IS DISTINCT FROM OLD.message
+            OR NEW.reasoning IS DISTINCT FROM OLD.reasoning
+            OR NEW.awaiting_input_status_id IS DISTINCT FROM OLD.awaiting_input_status_id THEN
+            NEW.current_status_id = gen_random_uuid();
+        END IF;
+    END IF;
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
 
 -- Create the flows table
 CREATE TABLE IF NOT EXISTS flows (
@@ -65,6 +85,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     payment_data JSONB NOT NULL,
     identifier_from_purchaser VARCHAR(255) NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    current_status_id UUID DEFAULT gen_random_uuid(),
+    awaiting_input_status_id UUID,
     message TEXT,
     result JSONB,
     reasoning TEXT,
@@ -82,8 +104,33 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 -- Create trigger for jobs table updated_at
-CREATE TRIGGER update_jobs_updated_at BEFORE UPDATE
-    ON jobs FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_jobs_metadata BEFORE UPDATE
+    ON jobs FOR EACH ROW EXECUTE FUNCTION update_job_metadata();
+
+-- Table to store HITL (lock) requests for jobs awaiting human input
+CREATE TABLE IF NOT EXISTS job_input_requests (
+    status_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id UUID NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    kodosumi_fid VARCHAR(255) NOT NULL,
+    lock_identifier VARCHAR(255) NOT NULL,
+    schema_raw JSONB,
+    schema_mip003 JSONB,
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    response_data JSONB,
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER update_job_input_requests_updated_at BEFORE UPDATE
+    ON job_input_requests FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE INDEX IF NOT EXISTS idx_job_input_requests_job_pending
+    ON job_input_requests (job_id) WHERE status = 'pending';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_job_lock_pending
+    ON job_input_requests (job_id, lock_identifier)
+    WHERE status IN ('pending', 'awaiting');
 
 -- Create indexes for jobs table
 CREATE INDEX IF NOT EXISTS idx_jobs_flow_uid ON jobs(flow_uid);

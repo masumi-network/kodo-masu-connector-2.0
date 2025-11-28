@@ -13,8 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the flow sync script and dependencies
 COPY flow-sync/flow_sync.py .
-COPY flow-sync/mip003_converter.py .
 COPY flow-sync/cron_logger.py .
+COPY shared ./shared
 
 # Make the script executable
 RUN chmod +x flow_sync.py

@@ -20,6 +20,17 @@ from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
 from database_payment_service import DatabasePaymentService
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SHARED_DIR_CANDIDATES = [
+    os.path.join(SCRIPT_DIR, 'shared'),
+    os.path.join(SCRIPT_DIR, '..', 'shared')
+]
+for shared_path in SHARED_DIR_CANDIDATES:
+    if os.path.isdir(shared_path) and shared_path not in sys.path:
+        sys.path.append(shared_path)
+
+from mip003_converter import convert_kodosumi_to_mip003  # noqa: E402
+
 # Load environment variables
 load_dotenv()
 
@@ -293,6 +304,108 @@ class KodosumiStatusChecker:
             return cleaned_dict, removed
 
         return value, 0
+
+    async def get_pending_lock_request(self, conn: asyncpg.Connection, job_id: str, lock_identifier: str) -> Optional[asyncpg.Record]:
+        """Fetch the latest pending lock request for a job."""
+        return await conn.fetchrow(
+            """
+            SELECT * FROM job_input_requests
+            WHERE job_id = $1::uuid
+              AND lock_identifier = $2
+              AND status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            job_id,
+            lock_identifier,
+        )
+
+    async def create_lock_request(
+        self,
+        conn: asyncpg.Connection,
+        job_id: str,
+        fid: str,
+        lock_identifier: str,
+        schema: List[Dict[str, Any]],
+    ) -> asyncpg.Record:
+        """Insert a new lock request for human input."""
+        schema_payload = {"elements": schema}
+        mip003_schema = convert_kodosumi_to_mip003(schema_payload)
+        return await conn.fetchrow(
+            """
+            INSERT INTO job_input_requests (
+                job_id, kodosumi_fid, lock_identifier, schema_raw, schema_mip003
+            )
+            VALUES ($1::uuid, $2, $3, $4::jsonb, $5::jsonb)
+            RETURNING *
+            """,
+            job_id,
+            fid,
+            lock_identifier,
+            json.dumps(schema),
+            json.dumps(mip003_schema),
+        )
+
+    async def fetch_lock_schema(self, fid: str, lock_identifier: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
+        """Retrieve the schema for a specific lock."""
+        lock_url = f"{self.kodosumi_server_url}/lock/{fid}/{lock_identifier}"
+        logger.info(f"Fetching lock schema for FID {fid} lock {lock_identifier}")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                lock_url,
+                headers={'KODOSUMI_API_KEY': api_key, 'Accept': 'application/json'},
+                timeout=30.0,
+            )
+            if response.status_code != 200:
+                logger.error(f"Failed to fetch lock schema ({response.status_code}): {response.text}")
+                return None
+            data = response.json()
+            if isinstance(data, dict) and 'elements' in data:
+                return data['elements']
+            return data if isinstance(data, list) else None
+
+    async def set_job_awaiting_input(self, conn: asyncpg.Connection, job_id: str, status_id: str, lock_identifier: str):
+        """Mark a job as awaiting human input with a specific status identifier."""
+        message = f"Awaiting human input ({lock_identifier})"
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'awaiting_input',
+                message = $2,
+                awaiting_input_status_id = $3::uuid,
+                current_status_id = $3::uuid,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE job_id = $1::uuid
+            """,
+            job_id,
+            message,
+            status_id,
+        )
+
+    async def ensure_lock_request(
+        self,
+        conn: asyncpg.Connection,
+        job: Dict[str, Any],
+        fid: str,
+        lock_identifier: str,
+        api_key: str,
+    ) -> bool:
+        """Ensure there is a pending lock request for the given job and lock."""
+        job_id = str(job['job_id'])
+        existing = await self.get_pending_lock_request(conn, job_id, lock_identifier)
+        if existing:
+            await self.set_job_awaiting_input(conn, job_id, str(existing['status_id']), lock_identifier)
+            return True
+
+        schema = await self.fetch_lock_schema(fid, lock_identifier, api_key)
+        if not schema:
+            logger.error(f"Unable to fetch schema for lock {lock_identifier} (FID {fid})")
+            return False
+
+        request_row = await self.create_lock_request(conn, job_id, fid, lock_identifier, schema)
+        await self.set_job_awaiting_input(conn, job_id, str(request_row['status_id']), lock_identifier)
+        logger.info(f"Created HITL request {request_row['status_id']} for job {job_id}")
+        return True
     
     async def submit_result_to_masumi(self, job: Dict[str, Any], final_result: str, api_key: str):
         """Submit job result to Masumi for payment completion."""
@@ -464,6 +577,16 @@ class KodosumiStatusChecker:
                             continue
                     
                     status = status_result.get('status', 'unknown')
+                    locks = status_result.get('locks') or []
+
+                    if status in ('awaiting', 'awaiting_input') and locks:
+                        lock_identifier = locks[0]
+                        logger.info(f"Job {job_id} requires human input for lock {lock_identifier}")
+                        if await self.ensure_lock_request(conn, job, fid, lock_identifier, kodosumi_api_key):
+                            jobs_processed += 1
+                        else:
+                            logger.error(f"Failed to prepare human input request for job {job_id}")
+                        continue
                     
                     if status == 'finished':
                         # Job is completed, update with final result

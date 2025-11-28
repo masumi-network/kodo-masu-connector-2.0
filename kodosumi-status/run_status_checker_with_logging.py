@@ -10,8 +10,15 @@ import fcntl
 from datetime import datetime
 
 # Add the parent directory to the Python path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shared'))
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.append(CURRENT_DIR)
+for shared_candidate in (
+    os.path.join(CURRENT_DIR, 'shared'),
+    os.path.join(CURRENT_DIR, '..', 'shared')
+):
+    if os.path.isdir(shared_candidate) and shared_candidate not in sys.path:
+        sys.path.append(shared_candidate)
 
 from kodosumi_status import KodosumiStatusChecker
 from cron_logger import CronExecutionLogger

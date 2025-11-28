@@ -5,11 +5,12 @@ from contextlib import asynccontextmanager
 import logging
 import uvicorn
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from enum import Enum
 from urllib.parse import unquote
 import os
 import asyncio
+import httpx
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -20,6 +21,7 @@ from models import (
     StartJobRequest, StartJobResponse, StatusResponse, 
     ProvideInputRequest, ProvideInputResponse,
     AvailabilityResponse, InputSchemaResponse, ErrorResponse,
+    InputField,
     Amount, FlowListResponse, FlowInfo
 )
 from middleware import (
@@ -27,6 +29,7 @@ from middleware import (
     setup_rate_limiting, metrics_endpoint, limiter
 )
 from cache import flow_cache, response_cache, schema_cache, not_found_cache
+from shared.mip003_converter import convert_kodosumi_to_mip003
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -391,6 +394,29 @@ async def check_job_status(
             })
             raise HTTPException(status_code=404, detail="Job not found for this flow")
         
+        job_id_str = str(job["job_id"])
+        status_identifier = job.get("current_status_id") or job_id_str
+        input_fields: Optional[List[InputField]] = None
+        input_schema_response: Optional[InputSchemaResponse] = None
+
+        if job["status"] == "awaiting_input":
+            pending_request = await db_manager.get_pending_input_request(job_id_str)
+            if pending_request:
+                schema = pending_request.get("schema_mip003")
+                if not schema and pending_request.get("schema_raw"):
+                    try:
+                        schema = convert_kodosumi_to_mip003({"elements": pending_request["schema_raw"]})
+                    except Exception as exc:
+                        logger.error(f"Failed to convert lock schema for job {job_id_str}: {exc}")
+                        schema = None
+                if schema:
+                    try:
+                        input_fields = [InputField(**field) for field in schema]
+                        input_schema_response = InputSchemaResponse(input_data=input_fields)
+                        status_identifier = pending_request.get("status_id", status_identifier)
+                    except Exception as exc:
+                        logger.error(f"Unable to build input schema for job {job_id_str}: {exc}")
+
         # Build status response
         # Check if this is a job that failed to start in Kodosumi
         # Jobs with status "error" and waiting_for_start_in_kodosumi=true failed to start
@@ -401,10 +427,11 @@ async def check_job_status(
         ):
             # This job failed to start in Kodosumi after max attempts
             response = StatusResponse(
+                status_id=status_identifier,
                 job_id=job_id,
                 status="failed",  # Return "failed" per MIP003 spec
                 message="Failed to start agent job",
-                result=None,
+                result=job.get("message"),
                 reasoning=None
             )
         else:
@@ -439,9 +466,13 @@ async def check_job_status(
                         # For other dict results, convert to JSON string
                         import json
                         result = json.dumps(result)
+            elif job.get("message"):
+                # Surface failure details in the result field so clients can display them
+                result = job.get("message")
             
             try:
                 response = StatusResponse(
+                    status_id=status_identifier,
                     job_id=job_id,
                     status=api_status,  # This should work with string value
                     message=job.get("message"),
@@ -454,10 +485,9 @@ async def check_job_status(
                 logger.error(f"db_status: {db_status}")
                 raise
         
-        # Add input_data if status is awaiting_input
-        if job["status"] == "awaiting_input":
-            # TODO: Add logic to determine required input fields
-            response.input_data = []
+        if input_fields:
+            response.input_data = input_fields
+            response.input_schema = input_schema_response
         
         # Cache response if job is completed or failed (won't change anymore)
         if response.status in ["completed", "failed"]:
@@ -505,15 +535,73 @@ async def provide_input(
                 status_code=400, 
                 detail=f"Job is not awaiting input (current status: {job['status']})"
             )
-        
-        # TODO: Process the additional input and update job
-        # For now, just update status to running
+
+        if job.get("awaiting_input_status_id") != input_request.status_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Status identifier does not match the current pending input request"
+            )
+
+        pending_request = await db_manager.get_input_request_by_status_id(input_request.status_id)
+        if not pending_request or pending_request.get("status") != "pending":
+            raise HTTPException(
+                status_code=404,
+                detail="Pending input request not found or already resolved"
+            )
+
+        kodosumi_api_key = await db_manager.get_latest_api_key()
+        if not kodosumi_api_key:
+            raise HTTPException(status_code=503, detail="No Kodosumi API key available to submit input")
+
+        kodosumi_fid = pending_request.get("kodosumi_fid")
+        lock_identifier = pending_request.get("lock_identifier")
+        if not kodosumi_fid or not lock_identifier:
+            raise HTTPException(status_code=500, detail="Lock metadata missing for this job")
+
+        lock_url = f"{config.KODOSUMI_SERVER_URL.rstrip('/')}/lock/{kodosumi_fid}/{lock_identifier}"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    lock_url,
+                    headers={
+                        "KODOSUMI_API_KEY": kodosumi_api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json=input_request.input_data,
+                    timeout=30.0,
+                )
+        except httpx.HTTPError as exc:
+            logger.error(f"Failed to submit lock data for job {job['job_id']}: {exc}")
+            raise HTTPException(status_code=502, detail="Failed to reach Kodosumi lock endpoint")
+
+        if response.status_code != 200:
+            error_msg = response.text
+            await db_manager.update_input_request_status(
+                input_request.status_id,
+                new_status="error",
+                error_message=error_msg
+            )
+            raise HTTPException(status_code=response.status_code, detail="Kodosumi rejected the additional input")
+
+        try:
+            response_payload = response.json()
+        except ValueError:
+            response_payload = {"raw": response.text}
+
+        await db_manager.update_input_request_status(
+            input_request.status_id,
+            new_status="completed",
+            response_data=response_payload
+        )
+
         await db_manager.update_job_status(
             job_id=input_request.job_id,
             status="running",
-            message="Additional input provided, processing job"
+            message="Additional input provided, processing job",
+            clear_awaiting_input=True
         )
-        
+
         return ProvideInputResponse(status="success")
         
     except HTTPException:

@@ -5,8 +5,19 @@ This is a one-time migration script.
 """
 
 import os
+import sys
 import json
 import psycopg2
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SHARED_DIR_CANDIDATES = [
+    os.path.join(SCRIPT_DIR, 'shared'),
+    os.path.join(SCRIPT_DIR, '..', 'shared')
+]
+for shared_path in SHARED_DIR_CANDIDATES:
+    if os.path.isdir(shared_path) and shared_path not in sys.path:
+        sys.path.append(shared_path)
+
 from mip003_converter import convert_kodosumi_to_mip003
 
 def get_db_connection():

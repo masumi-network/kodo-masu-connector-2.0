@@ -17,6 +17,9 @@ class Config:
     AGENT_IDENTIFIER: str = os.getenv("AGENT_IDENTIFIER", "kodosumi-service")
     NETWORK: str = os.getenv("NETWORK", "Preprod")
     
+    # Kodosumi server
+    KODOSUMI_SERVER_URL: str = os.getenv("KODOSUMI_SERVER_URL", "http://localhost:3370")
+    
     @property
     def database_url(self) -> str:
         """Get the database connection URL."""

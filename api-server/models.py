@@ -40,15 +40,18 @@ class InputField(BaseModel):
     validations: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="Validation rules for the field")
 
 class StatusResponse(BaseModel):
+    status_id: str = Field(..., description="Unique identifier for this status instance")
     job_id: str = Field(..., description="Job ID")
     status: JobStatus = Field(..., description="Current status of the job")
     message: Optional[str] = Field(None, description="Optional status message")
     input_data: Optional[List[InputField]] = Field(None, description="Required input data when status is awaiting_input")
+    input_schema: Optional['InputSchemaResponse'] = Field(None, description="Structured schema when awaiting input")
     result: Optional[str] = Field(None, description="Job result if available")
     reasoning: Optional[str] = Field(None, description="AI reasoning or explanation for the result")
 
 class ProvideInputRequest(BaseModel):
     job_id: str = Field(..., description="Job ID awaiting input")
+    status_id: str = Field(..., description="Status identifier returned by /status")
     input_data: Dict[str, Union[str, int, float, bool, List[str], List[int], None]] = Field(..., description="Additional input data")
 
 class ProvideInputResponse(BaseModel):
@@ -77,3 +80,6 @@ class FlowInfo(BaseModel):
 
 class FlowListResponse(BaseModel):
     flows: List[FlowInfo] = Field(..., description="List of available flows")
+
+# Resolve forward references
+StatusResponse.model_rebuild()

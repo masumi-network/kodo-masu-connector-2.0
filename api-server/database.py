@@ -148,43 +148,89 @@ class DatabaseManager:
             if row:
                 job_data = dict(row)
                 # Parse JSON fields
+                if job_data.get('job_id'):
+                    job_data['job_id'] = str(job_data['job_id'])
                 if job_data.get('input_data'):
                     job_data['input_data'] = json.loads(job_data['input_data'])
                 if job_data.get('payment_data'):
                     job_data['payment_data'] = json.loads(job_data['payment_data'])
                 if job_data.get('result'):
                     job_data['result'] = json.loads(job_data['result'])
+                if job_data.get('current_status_id'):
+                    job_data['current_status_id'] = str(job_data['current_status_id'])
+                if job_data.get('awaiting_input_status_id'):
+                    job_data['awaiting_input_status_id'] = str(job_data['awaiting_input_status_id'])
                 return job_data
             return None
     
-    async def update_job_status(self, job_id: str, status: str, 
-                               result: Optional[Dict[str, Any]] = None,
-                               message: Optional[str] = None,
-                               reasoning: Optional[str] = None,
-                               waiting_for_start: Optional[bool] = None):
+    async def update_job_status(
+        self,
+        job_id: str,
+        status: str,
+        result: Optional[Dict[str, Any]] = None,
+        message: Optional[str] = None,
+        reasoning: Optional[str] = None,
+        waiting_for_start: Optional[bool] = None,
+        *,
+        awaiting_input_status_id: Optional[str] = None,
+        clear_awaiting_input: bool = False,
+        new_status_id: Optional[str] = None,
+    ):
         """Update job status and optionally result, message, reasoning, and waiting flag."""
         async with self._pool.acquire() as conn:
-            if result:
+            if result is not None:
                 await conn.execute(
                     """
                     UPDATE jobs 
-                    SET status = $1, result = $2, message = $3, reasoning = $4,
-                        waiting_for_start_in_kodosumi = COALESCE($5, waiting_for_start_in_kodosumi),
+                    SET status = $1,
+                        result = $2,
+                        message = $3,
+                        reasoning = $4,
+                        waiting_for_start_in_kodosumi = COALESCE($7, waiting_for_start_in_kodosumi),
+                        awaiting_input_status_id = CASE
+                            WHEN $5::uuid IS NOT NULL THEN $5::uuid
+                            WHEN $6 THEN NULL
+                            ELSE awaiting_input_status_id
+                        END,
+                        current_status_id = COALESCE($8::uuid, gen_random_uuid()),
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE job_id = $6
+                    WHERE job_id = $9
                     """,
-                    status, json.dumps(result), message, reasoning, waiting_for_start, job_id
+                    status,
+                    json.dumps(result),
+                    message,
+                    reasoning,
+                    awaiting_input_status_id,
+                    clear_awaiting_input,
+                    waiting_for_start,
+                    new_status_id,
+                    job_id,
                 )
             else:
                 await conn.execute(
                     """
                     UPDATE jobs 
-                    SET status = $1, message = $2, reasoning = $3,
-                        waiting_for_start_in_kodosumi = COALESCE($4, waiting_for_start_in_kodosumi),
+                    SET status = $1,
+                        message = $2,
+                        reasoning = $3,
+                        awaiting_input_status_id = CASE
+                            WHEN $4::uuid IS NOT NULL THEN $4::uuid
+                            WHEN $5 THEN NULL
+                            ELSE awaiting_input_status_id
+                        END,
+                        current_status_id = COALESCE($6::uuid, gen_random_uuid()),
+                        waiting_for_start_in_kodosumi = COALESCE($7, waiting_for_start_in_kodosumi),
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE job_id = $5
+                    WHERE job_id = $8
                     """,
-                    status, message, reasoning, waiting_for_start, job_id
+                    status,
+                    message,
+                    reasoning,
+                    awaiting_input_status_id,
+                    clear_awaiting_input,
+                    new_status_id,
+                    waiting_for_start,
+                    job_id,
                 )
 
     async def get_pool_stats(self) -> Dict[str, Any]:
@@ -198,6 +244,99 @@ class DatabaseManager:
             "max_size": self._pool.get_max_size(),
             "min_size": self._pool.get_min_size()
         }
+
+    async def get_latest_api_key(self) -> Optional[str]:
+        """Fetch the latest stored Kodosumi API key."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT api_key FROM api_keys ORDER BY created_at DESC LIMIT 1"
+            )
+            return row['api_key'] if row else None
+
+    async def get_pending_input_request(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Return the most recent pending input request for a job."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM job_input_requests
+                WHERE job_id = $1 AND status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                job_id,
+            )
+            return self._parse_input_request(row) if row else None
+
+    async def get_input_request_by_status_id(self, status_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch an input request by its status identifier."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM job_input_requests WHERE status_id = $1",
+                status_id,
+            )
+            return self._parse_input_request(row) if row else None
+
+    async def create_input_request(
+        self,
+        job_id: str,
+        kodosumi_fid: str,
+        lock_identifier: str,
+        schema_raw: Optional[Dict[str, Any]],
+        schema_mip003: Optional[List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Create a new human-in-the-loop input request."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO job_input_requests (
+                    job_id, kodosumi_fid, lock_identifier, schema_raw, schema_mip003
+                ) VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+                """,
+                job_id,
+                kodosumi_fid,
+                lock_identifier,
+                json.dumps(schema_raw) if schema_raw is not None else None,
+                json.dumps(schema_mip003) if schema_mip003 is not None else None,
+            )
+            return self._parse_input_request(row)
+
+    async def update_input_request_status(
+        self,
+        status_id: str,
+        *,
+        new_status: str,
+        response_data: Optional[Dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+    ):
+        """Mark an input request as completed or errored."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE job_input_requests
+                SET status = $2,
+                    response_data = COALESCE($3, response_data),
+                    error_message = COALESCE($4, error_message),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status_id = $1
+                """,
+                status_id,
+                new_status,
+                json.dumps(response_data) if response_data is not None else None,
+                error_message,
+            )
+
+    def _parse_input_request(self, row: Optional[asyncpg.Record]) -> Optional[Dict[str, Any]]:
+        """Convert a raw input request row into a dict with parsed JSON."""
+        if not row:
+            return None
+        data = dict(row)
+        for field in ('schema_raw', 'schema_mip003', 'response_data'):
+            if data.get(field):
+                data[field] = json.loads(data[field])
+        if data.get('status_id'):
+            data['status_id'] = str(data['status_id'])
+        return data
 
 # Global database manager instance
 db_manager = DatabaseManager()

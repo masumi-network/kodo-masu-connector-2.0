@@ -11,6 +11,16 @@ from typing import Dict, List, Optional, Any
 import asyncio
 from cron_logger import CronExecutionLogger
 
+# Ensure shared utilities are importable
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SHARED_DIR_CANDIDATES = [
+    os.path.join(SCRIPT_DIR, 'shared'),
+    os.path.join(SCRIPT_DIR, '..', 'shared')
+]
+for shared_path in SHARED_DIR_CANDIDATES:
+    if os.path.isdir(shared_path) and shared_path not in sys.path:
+        sys.path.append(shared_path)
+
 # Import MIP003 converter
 from mip003_converter import convert_kodosumi_to_mip003
 

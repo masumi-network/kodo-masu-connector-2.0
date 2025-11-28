@@ -16,8 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY kodosumi-status/ .
 
-# Copy shared cron logger module
-COPY shared/cron_logger.py .
+# Copy shared utilities
+COPY shared ./shared
 
 # Copy api-server files for payment_service module
 COPY api-server/ /app/api-server/
