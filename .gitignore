@@ -79,6 +79,7 @@ docker-compose.override.yml
 *.sqlite
 *.sqlite3
 postgres_data/
+kodosumi_db_dump.sql
 
 # Logs
 logs/
