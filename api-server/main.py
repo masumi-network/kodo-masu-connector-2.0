@@ -719,13 +719,12 @@ async def global_availability():
 @limiter.limit("100/minute")
 async def health_check(request: Request):
     """Health check endpoint - optimized for high concurrency."""
-    # This is handled by HealthCheckMiddleware for better performance
-    # But we keep this as a fallback
-    return {
-        "status": "healthy", 
+    payload = {
+        "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "circuit_breaker": payment_service.get_circuit_breaker_status()
     }
+    return JSONResponse(payload, headers={"Connection": "close"})
 
 @app.get("/health/detailed")
 @limiter.limit("10/minute")
@@ -741,7 +740,7 @@ async def health_check_detailed(request: Request):
         # Check circuit breaker
         circuit_status = payment_service.get_circuit_breaker_status()
         
-        return {
+        payload = {
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
             "components": {
@@ -759,6 +758,7 @@ async def health_check_detailed(request: Request):
                 }
             }
         }
+        return JSONResponse(payload, headers={"Connection": "close"})
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return {
