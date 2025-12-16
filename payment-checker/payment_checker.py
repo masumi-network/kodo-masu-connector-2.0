@@ -3,11 +3,25 @@ import asyncio
 import asyncpg
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from masumi.payment import Payment
 from masumi.config import Config as MasumiConfig
-from cron_logger import CronExecutionLogger
+
+# Ensure shared modules are importable both locally and in containers
+CURRENT_DIR = Path(__file__).resolve().parent
+for base_dir in (CURRENT_DIR, CURRENT_DIR.parent):
+    shared_dir = base_dir / 'shared'
+    if shared_dir.exists():
+        base_path = str(base_dir)
+        if base_path not in sys.path:
+            sys.path.append(base_path)
+        break
+
+from shared.cron_logger import CronExecutionLogger
+from shared.status_messages import WORKING_STATUS_MESSAGE
 
 # Load environment variables
 load_dotenv()
@@ -113,17 +127,27 @@ class PaymentChecker:
             logger.error(f"Failed to get payment status for job {job['job_id']}: {e}")
             return None
     
-    async def update_job_status(self, conn: asyncpg.Connection, job_id: str, 
-                               new_status: str, waiting_for_start: bool = True) -> bool:
+    async def update_job_status(
+        self,
+        conn: asyncpg.Connection,
+        job_id: str,
+        new_status: str,
+        *,
+        waiting_for_start: bool = True,
+        message: Optional[str] = None,
+    ) -> bool:
         """Update job status and waiting_for_start_in_kodosumi flag."""
         try:
             query = """
                 UPDATE jobs 
-                SET status = $1, waiting_for_start_in_kodosumi = $2, updated_at = CURRENT_TIMESTAMP
+                SET status = $1,
+                    waiting_for_start_in_kodosumi = $2,
+                    message = COALESCE($4, message),
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE job_id = $3
             """
             
-            result = await conn.execute(query, new_status, waiting_for_start, job_id)
+            result = await conn.execute(query, new_status, waiting_for_start, job_id, message)
             return True
             
         except Exception as e:
@@ -211,10 +235,11 @@ class PaymentChecker:
                     logger.info(f"Payment for job {job['job_id']} is now locked. Updating status to 'running'")
                     
                     success = await self.update_job_status(
-                        conn, 
-                        str(job['job_id']), 
-                        'running', 
-                        waiting_for_start=True
+                        conn,
+                        str(job['job_id']),
+                        'running',
+                        waiting_for_start=True,
+                        message=WORKING_STATUS_MESSAGE
                     )
                     
                     if success:

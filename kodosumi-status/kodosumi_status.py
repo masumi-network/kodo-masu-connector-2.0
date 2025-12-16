@@ -14,9 +14,11 @@ import httpx
 import logging
 import os
 import json
+import re
 import sys
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
+from html import unescape
 from dotenv import load_dotenv
 from database_payment_service import DatabasePaymentService
 
@@ -30,6 +32,7 @@ for shared_path in SHARED_DIR_CANDIDATES:
         sys.path.append(shared_path)
 
 from mip003_converter import convert_kodosumi_to_mip003  # noqa: E402
+from status_messages import WORKING_STATUS_MESSAGE  # noqa: E402
 
 # Load environment variables
 load_dotenv()
@@ -48,6 +51,10 @@ PAYMENT_SERVICE_AVAILABLE = True
 MAX_TIMEOUT_ATTEMPTS = 20
 MAX_NOT_FOUND_ATTEMPTS = 20
 FINAL_RETRY_DELAY = timedelta(minutes=30)
+MAX_STREAM_BYTES = 65536
+MAX_STREAM_DURATION = 2.0
+STREAM_TIMESTAMP_RE = re.compile(r'^\d+(?:\.\d+)?:')
+HTML_TAG_RE = re.compile(r'<[^>]+>')
 
 class KodosumiStatusChecker:
     """Service for checking status of jobs in Kodosumi."""
@@ -68,6 +75,160 @@ class KodosumiStatusChecker:
         password = os.getenv('POSTGRES_PASSWORD')
         
         return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+    
+    @staticmethod
+    def _strip_stream_prefix(value: str) -> str:
+        """Remove SSE timestamp or helper prefixes from a data line."""
+        if not value:
+            return value
+        match = STREAM_TIMESTAMP_RE.match(value)
+        if match:
+            value = value[match.end():]
+        # Remove helper prefixes like "dict:" that appear before JSON payloads
+        if value.startswith('dict:'):
+            return value[5:]
+        if value.startswith('list:'):
+            return value[5:]
+        return value
+
+    @staticmethod
+    def _clean_stream_text(fragment: str) -> Optional[str]:
+        """Convert HTML-ish fragments from the SSE stream into readable text."""
+        if not fragment:
+            return None
+        text = fragment
+        replacements = {
+            '<br />': '\n',
+            '<br/>': '\n',
+            '<br>': '\n',
+            '</p>': '\n',
+            '<p>': '\n',
+            '</div>': '\n',
+            '<div>': '\n',
+            '</ul>': '\n',
+            '<ul>': '\n',
+            '</ol>': '\n',
+            '<ol>': '\n',
+        }
+        for needle, replacement in replacements.items():
+            text = text.replace(needle, replacement)
+        text = text.replace('<li>', '\n- ')
+        text = text.replace('</li>', '')
+        text = text.replace('<strong>', '')
+        text = text.replace('</strong>', '')
+        text = text.replace('<em>', '')
+        text = text.replace('</em>', '')
+        text = unescape(text)
+        text = HTML_TAG_RE.sub('', text)
+        text = text.replace('\xa0', ' ')
+        lines = [line.strip() for line in text.splitlines()]
+        cleaned = '\n'.join(line for line in lines if line)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        cleaned = cleaned.strip()
+        return cleaned or None
+
+    def _extract_latest_stream_message(self, raw_stream: str) -> Optional[str]:
+        """Parse the SSE stream and return the latest progress message."""
+        if not raw_stream:
+            return None
+        normalized = raw_stream.replace('\r\n', '\n')
+        blocks: List[List[str]] = []
+        current: List[str] = []
+        for line in normalized.split('\n'):
+            if not line.strip():
+                if current:
+                    blocks.append(current)
+                    current = []
+                continue
+            current.append(line)
+        if current:
+            blocks.append(current)
+        latest_message: Optional[str] = None
+        for block in blocks:
+            event_type = None
+            data_lines: List[str] = []
+            for line in block:
+                if line.startswith('event:'):
+                    event_type = line.split(':', 1)[1].strip()
+                elif line.startswith('data:'):
+                    payload = line.split(':', 1)[1]
+                    data_lines.append(payload.lstrip())
+            if event_type == 'result' and data_lines:
+                cleaned_lines = [self._strip_stream_prefix(dl) for dl in data_lines]
+                combined = '\n'.join(cleaned_lines).strip()
+                cleaned = self._clean_stream_text(combined)
+                if cleaned:
+                    latest_message = cleaned
+        return latest_message
+
+    async def fetch_latest_progress_message(self, fid: str, api_key: str) -> Optional[str]:
+        """Download the main event stream and extract the latest progress snippet."""
+        stream_url = f"{self.kodosumi_server_url.rstrip('/')}/outputs/main/{fid}"
+        try:
+            timeout = httpx.Timeout(10.0, read=3.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    'GET',
+                    stream_url,
+                    headers={'KODOSUMI_API_KEY': api_key},
+                    timeout=timeout,
+                ) as response:
+                    if response.status_code != 200:
+                        logger.warning(
+                            f"Failed to fetch progress stream for fid {fid}: HTTP {response.status_code}"
+                        )
+                        return None
+                    chunks: List[str] = []
+                    bytes_read = 0
+                    loop = asyncio.get_running_loop()
+                    start_time = loop.time()
+                    async for chunk in response.aiter_text():
+                        if chunk:
+                            chunks.append(chunk)
+                            bytes_read += len(chunk)
+                        if bytes_read >= MAX_STREAM_BYTES:
+                            break
+                        if loop.time() - start_time >= MAX_STREAM_DURATION:
+                            break
+            if not chunks:
+                return None
+            return self._extract_latest_stream_message(''.join(chunks))
+        except httpx.HTTPError as exc:
+            logger.warning(f"Error fetching progress stream for fid {fid}: {exc}")
+            return None
+
+    async def update_running_job_progress(
+        self,
+        conn: asyncpg.Connection,
+        job: Dict[str, Any],
+        api_key: str,
+    ) -> bool:
+        """Ensure running jobs show a consistent user-friendly message without extra queries."""
+        current_message = (job.get('message') or '').strip()
+        if current_message == WORKING_STATUS_MESSAGE:
+            return False
+        try:
+            result = await conn.execute(
+                """
+                UPDATE jobs
+                SET message = $2,
+                    current_status_id = gen_random_uuid(),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = $1::uuid
+                """,
+                str(job['job_id']),
+                WORKING_STATUS_MESSAGE,
+            )
+            if result == "UPDATE 1":
+                logger.info(
+                    f"Set running job {job['job_id']} message to standard working text"
+                )
+                return True
+            logger.warning(f"Progress update for job {job['job_id']} did not modify any rows")
+            return False
+        except Exception as exc:
+            logger.error(f"Failed to update progress message for job {job['job_id']}: {exc}")
+            return False
     
     async def get_latest_api_key(self, conn: asyncpg.Connection) -> Optional[str]:
         """Get the latest API key from the database."""
@@ -93,11 +254,12 @@ class KodosumiStatusChecker:
                    j.payment_data, j.input_data, j.identifier_from_purchaser,
                    j.agent_identifier_used, j.payment_required,
                    j.created_at, j.updated_at, j.timeout_attempts, j.not_found_attempts,
+                   j.message,
                    f.summary as flow_summary,
                    COALESCE(f.agent_identifier_default, f.agent_identifier) AS flow_agent_identifier
             FROM jobs j
             LEFT JOIN flows f ON j.flow_uid = f.uid
-            WHERE j.status = 'running' 
+            WHERE j.status IN ('running', 'awaiting_input')
               AND j.result->>'kodosumi_fid' IS NOT NULL
               AND j.timeout_attempts <= {MAX_TIMEOUT_ATTEMPTS}
               AND j.not_found_attempts <= {MAX_NOT_FOUND_ATTEMPTS}
@@ -126,7 +288,8 @@ class KodosumiStatusChecker:
                 'created_at': row['created_at'],
                 'updated_at': row['updated_at'],
                 'timeout_attempts': row['timeout_attempts'],
-                'not_found_attempts': row['not_found_attempts']
+                'not_found_attempts': row['not_found_attempts'],
+                'message': row['message']
             })
         
         return jobs
@@ -617,6 +780,8 @@ class KodosumiStatusChecker:
                         )
                     elif status == 'running':
                         logger.info(f"Job {job_id} is still running in Kodosumi")
+                        if await self.update_running_job_progress(conn, job, kodosumi_api_key):
+                            jobs_processed += 1
                     else:
                         logger.warning(f"Job {job_id} has unknown status in Kodosumi: {status}")
                 else:

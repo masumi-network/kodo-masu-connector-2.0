@@ -11,6 +11,9 @@ from urllib.parse import unquote
 import os
 import asyncio
 import httpx
+import json
+import re
+from html import unescape
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from masumi import create_masumi_input_hash
@@ -31,6 +34,11 @@ from middleware import (
 )
 from cache import flow_cache, response_cache, schema_cache, not_found_cache
 from shared.mip003_converter import convert_kodosumi_to_mip003
+from shared.status_messages import (
+    PAYMENT_PENDING_MESSAGE,
+    WORKING_STATUS_MESSAGE,
+    AWAITING_INPUT_MESSAGE,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +54,8 @@ def _load_max_start_attempts() -> int:
     return max(1, attempts)
 
 MAX_START_ATTEMPTS = _load_max_start_attempts()
+
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 class FlowVariant(str, Enum):
@@ -94,6 +104,128 @@ def resolve_agent_identifier(flow: Dict[str, Any], variant: FlowVariant) -> Tupl
         return free_agent.strip(), False
     # Fallback to default agent when free mode is enabled but no dedicated identifier is set
     return (default_agent.strip() if isinstance(default_agent, str) else None, False)
+
+
+def _clean_schema_text(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = HTML_TAG_RE.sub("", value)
+    cleaned = cleaned.replace("\r", "").strip()
+    if not cleaned:
+        return None
+    return unescape(cleaned)
+
+
+def _extract_pending_input_context(pending_request: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not pending_request:
+        return None
+
+    schema_raw = pending_request.get("schema_raw")
+    if isinstance(schema_raw, str):
+        try:
+            schema_raw = json.loads(schema_raw)
+        except (ValueError, json.JSONDecodeError):
+            schema_raw = None
+
+    segments: List[str] = []
+    if isinstance(schema_raw, list):
+        for element in schema_raw:
+            if not isinstance(element, dict):
+                continue
+            text_value = element.get("text")
+            cleaned_text = _clean_schema_text(text_value)
+            if cleaned_text:
+                segments.append(cleaned_text)
+                continue
+            if element.get("type") in {"textarea", "input"}:
+                parts = []
+                label = element.get("label") or element.get("name")
+                if isinstance(label, str) and label.strip():
+                    parts.append(label.strip())
+                default_value = element.get("value") or element.get("placeholder")
+                cleaned_default = _clean_schema_text(default_value)
+                if cleaned_default:
+                    parts.append(cleaned_default)
+                if parts:
+                    segments.append(": ".join(parts))
+        if segments:
+            return "\n\n".join(segments)
+
+    lock_identifier = pending_request.get("lock_identifier")
+    if isinstance(lock_identifier, str) and lock_identifier:
+        return f"{AWAITING_INPUT_MESSAGE} (lock {lock_identifier})"
+
+    return None
+
+
+def _extract_final_output_text(payload: Any) -> Optional[str]:
+    """Return a human-readable string from nested Kodosumi output structures."""
+    if payload in (None, ""):
+        return None
+
+    data = payload
+
+    if isinstance(data, str):
+        text = data.strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except (ValueError, json.JSONDecodeError):
+            return text
+
+    if isinstance(data, list):
+        for item in data:
+            extracted = _extract_final_output_text(item)
+            if extracted:
+                return extracted
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    markdown = data.get("Markdown")
+    if isinstance(markdown, dict):
+        body = markdown.get("body")
+        if isinstance(body, str) and body.strip():
+            return body.strip()
+
+    for key in ("body", "text", "message"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    for key in ("final_result", "final", "result", "output"):
+        nested = data.get(key)
+        extracted = _extract_final_output_text(nested)
+        if extracted:
+            return extracted
+
+    return None
+
+
+def _build_user_friendly_message(job: Dict[str, Any], pending_request: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Convert internal job metadata into a user-facing message."""
+    status = job.get("status")
+    base_message = job.get("message")
+
+    if status == "awaiting_payment":
+        return PAYMENT_PENDING_MESSAGE
+
+    if status in {"running", "working"}:
+        return WORKING_STATUS_MESSAGE
+
+    if status == "awaiting_input":
+        detailed_prompt = _extract_pending_input_context(pending_request)
+        return detailed_prompt or AWAITING_INPUT_MESSAGE
+
+    if status == "error":
+        final_text = _extract_final_output_text(job.get("result"))
+        if final_text and base_message:
+            return f"{final_text}\n\nError: {base_message}"
+        return final_text or base_message
+
+    return base_message
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -302,11 +434,10 @@ async def start_job(
 
         # Update job status with message
         if payment_required:
-            message = f"Payment requested. Blockchain ID: {blockchain_identifier}" if blockchain_identifier else "Payment requested"
             await db_manager.update_job_status(
                 job_id=created_job_id,
                 status="awaiting_payment",
-                message=message,
+                message=PAYMENT_PENDING_MESSAGE,
                 waiting_for_start=False
             )
         else:
@@ -398,6 +529,7 @@ async def check_job_status(
         status_identifier = job.get("current_status_id") or job_id_str
         input_fields: Optional[List[InputField]] = None
         input_schema_response: Optional[InputSchemaResponse] = None
+        pending_request: Optional[Dict[str, Any]] = None
 
         if job["status"] == "awaiting_input":
             pending_request = await db_manager.get_pending_input_request(job_id_str)
@@ -417,6 +549,8 @@ async def check_job_status(
                     except Exception as exc:
                         logger.error(f"Unable to build input schema for job {job_id_str}: {exc}")
 
+        user_friendly_message = _build_user_friendly_message(job, pending_request)
+
         # Build status response
         # Check if this is a job that failed to start in Kodosumi
         # Jobs with status "error" and waiting_for_start_in_kodosumi=true failed to start
@@ -430,7 +564,7 @@ async def check_job_status(
                 status_id=status_identifier,
                 job_id=job_id,
                 status="failed",  # Return "failed" per MIP003 spec
-                message="Failed to start agent job",
+                message=user_friendly_message or "Failed to start agent job",
                 result=job.get("message"),
                 reasoning=None
             )
@@ -466,6 +600,8 @@ async def check_job_status(
                         # For other dict results, convert to JSON string
                         import json
                         result = json.dumps(result)
+            elif user_friendly_message is not None:
+                result = user_friendly_message
             elif job.get("message"):
                 # Surface failure details in the result field so clients can display them
                 result = job.get("message")
@@ -475,7 +611,7 @@ async def check_job_status(
                     status_id=status_identifier,
                     job_id=job_id,
                     status=api_status,  # This should work with string value
-                    message=job.get("message"),
+                    message=user_friendly_message if user_friendly_message is not None else job.get("message"),
                     result=result,  # Will be None unless job is completed
                     reasoning=job.get("reasoning") if db_status == "completed" else None
                 )
@@ -599,7 +735,7 @@ async def provide_input(
         await db_manager.update_job_status(
             job_id=input_request.job_id,
             status="running",
-            message="Additional input provided, processing job",
+            message=WORKING_STATUS_MESSAGE,
             clear_awaiting_input=True
         )
 

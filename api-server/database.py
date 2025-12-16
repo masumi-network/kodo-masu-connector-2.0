@@ -259,7 +259,8 @@ class DatabaseManager:
             row = await conn.fetchrow(
                 """
                 SELECT * FROM job_input_requests
-                WHERE job_id = $1 AND status = 'pending'
+                WHERE job_id = $1
+                  AND status IN ('pending', 'awaiting', 'awaiting_input')
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
