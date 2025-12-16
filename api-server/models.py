@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices
 from typing import Dict, Any, List, Optional, Union
 from enum import Enum
 
@@ -40,7 +40,13 @@ class InputField(BaseModel):
     validations: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="Validation rules for the field")
 
 class StatusResponse(BaseModel):
-    status_id: str = Field(..., description="Unique identifier for this status instance")
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+    status_id: str = Field(
+        ...,
+        description="Unique identifier for this status instance",
+        serialization_alias="id",
+        validation_alias=AliasChoices("id", "status_id")
+    )
     job_id: str = Field(..., description="Job ID")
     status: JobStatus = Field(..., description="Current status of the job")
     message: Optional[str] = Field(None, description="Optional status message")
@@ -51,11 +57,18 @@ class StatusResponse(BaseModel):
 
 class ProvideInputRequest(BaseModel):
     job_id: str = Field(..., description="Job ID awaiting input")
-    status_id: str = Field(..., description="Status identifier returned by /status")
+    status_id: str = Field(
+        ...,
+        description="Status identifier returned by /status",
+        serialization_alias="id",
+        validation_alias=AliasChoices("id", "status_id")
+    )
     input_data: Dict[str, Union[str, int, float, bool, List[str], List[int], None]] = Field(..., description="Additional input data")
 
 class ProvideInputResponse(BaseModel):
     status: str = Field(..., description="Status of the input provision")
+    input_hash: str = Field(..., description="Hash of the supplemental input payload")
+    signature: str = Field(..., description="Placeholder for future signed inputs")
 
 class AvailabilityResponse(BaseModel):
     status: str = Field(..., description="Server status")

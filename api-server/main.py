@@ -13,6 +13,7 @@ import asyncio
 import httpx
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from masumi import create_masumi_input_hash
 
 from database import db_manager
 from payment_service import payment_service
@@ -486,12 +487,14 @@ async def check_job_status(
         
         if input_fields:
             response.input_schema = input_schema_response
+
+        response_payload = response.model_dump(by_alias=True)
         
         # Cache response if job is completed or failed (won't change anymore)
         if response.status in ["completed", "failed"]:
-            await response_cache.set("status", {"key": cache_key}, response)
+            await response_cache.set("status", {"key": cache_key}, response_payload)
         
-        return response
+        return response_payload
         
     except HTTPException:
         raise
@@ -600,7 +603,29 @@ async def provide_input(
             clear_awaiting_input=True
         )
 
-        return ProvideInputResponse(status="success")
+        input_hash_value = ""
+        identifier_from_purchaser = job.get("identifier_from_purchaser")
+        if identifier_from_purchaser:
+            try:
+                input_hash_value = create_masumi_input_hash(
+                    input_request.input_data,
+                    str(identifier_from_purchaser)
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Failed to calculate input hash for job {job['job_id']}: {exc}"
+                )
+        else:
+            logger.warning(
+                f"No purchaser identifier found for job {job['job_id']}; "
+                "input hash response will be empty"
+            )
+
+        return ProvideInputResponse(
+            status="success",
+            input_hash=input_hash_value or "",
+            signature="to-be-replaced-in-future"
+        )
         
     except HTTPException:
         raise
