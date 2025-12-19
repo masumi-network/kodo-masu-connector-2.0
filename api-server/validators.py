@@ -7,6 +7,7 @@ matches the expected schema format and constraints.
 
 from typing import Dict, List, Any, Union, Optional
 import re
+from urllib.parse import urlparse
 
 
 class ValidationError(Exception):
@@ -68,6 +69,8 @@ def validate_input_data(
             validate_boolean_field(field_id, value, field)
         elif field_type == 'option':
             validate_option_field(field_id, value, field, validations)
+        elif field_type == 'file':
+            validate_file_field(field_id, value, field, validations)
     
     # Check for unexpected fields
     expected_fields = set(field_map.keys())
@@ -198,3 +201,27 @@ def validate_option_field(
         raise ValidationError(field_id, f"Must select at least {min_val} option(s)")
     if max_val is not None and len(value) > max_val:
         raise ValidationError(field_id, f"Must select at most {max_val} option(s)")
+
+
+def validate_file_field(
+    field_id: str,
+    value: Any,
+    field: Dict[str, Any],
+    validations: List[Dict[str, Any]]
+) -> None:
+    """Validate a file field (expecting URL-based uploads)."""
+    if value is None:
+        raise ValidationError(field_id, "File value cannot be null")
+
+    if not isinstance(value, str):
+        raise ValidationError(field_id, f"Expected string URL, got {type(value).__name__}")
+
+    trimmed = value.strip()
+    if not trimmed:
+        raise ValidationError(field_id, "File value cannot be empty")
+
+    output_format = field.get('data', {}).get('outputFormat', 'url')
+    if output_format == 'url':
+        parsed = urlparse(trimmed)
+        if parsed.scheme not in ("http", "https"):
+            raise ValidationError(field_id, "File URL must start with http:// or https://")

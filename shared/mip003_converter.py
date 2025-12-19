@@ -18,15 +18,16 @@ class MIP003Converter:
         """Initialize the converter with mapping configurations."""
         self.type_mapping = {
             'text': 'string',
-            'password': 'password',
+            'password': 'string',
             'number': 'number',
             'textarea': 'textarea',
-            'date': 'date',
-            'time': 'time',
-            'datetime-local': 'datetime',
+            'date': 'string',
+            'time': 'string',
+            'datetime-local': 'string',
             'boolean': 'boolean',
             'select': 'option',
-            'checkbox': 'checkbox'
+            'checkbox': 'boolean',
+            'file': 'file'
         }
     
     def convert_schema(self, kodosumi_schema: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -105,14 +106,6 @@ class MIP003Converter:
         if element.get('placeholder'):
             data['placeholder'] = element['placeholder']
         
-        # Add description if provided
-        if element.get('description'):
-            data['description'] = element['description']
-        
-        # Add default value if provided (supports falsy values like 0 or False)
-        if element.get('value') is not None:
-            data['default'] = element.get('value')
-        
         # Handle select options
         if element.get('type') == 'select' and element.get('option'):
             values = []
@@ -131,10 +124,29 @@ class MIP003Converter:
             if values:
                 data['values'] = values
         
-        # Handle checkbox description fallback
+        # Handle checkbox options
         elif element.get('type') == 'checkbox' and element.get('option'):
-            # Use checkbox option text as description if none provided
-            data.setdefault('description', element.get('option', ''))
+            # For checkboxes, the option text can serve as placeholder
+            data['placeholder'] = element.get('option', '')
+
+        # Handle file inputs
+        elif element.get('type') == 'file':
+            accept = element.get('accept')
+            if accept:
+                data['accept'] = accept
+
+            max_size = element.get('maxSize') or element.get('max_size')
+            if max_size:
+                data['maxSize'] = str(max_size)
+
+            # MIP003 output format for files defaults to URL
+            data['outputFormat'] = element.get('outputFormat', 'url')
+
+            # Preserve multiple/directory hints if provided
+            if element.get('multiple') is not None:
+                data['multiple'] = str(bool(element['multiple'])).lower()
+            if element.get('directory') is not None:
+                data['directory'] = str(bool(element['directory'])).lower()
     
     def _add_validations(self, element: Dict[str, Any], mip003_element: Dict[str, Any]):
         """

@@ -13,7 +13,9 @@ import httpx
 import logging
 import os
 import json
+import mimetypes
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from cron_logger import CronExecutionLogger
 
@@ -152,6 +154,74 @@ class KodosumiStarter:
         
         return converted_data
 
+    async def _prepare_payloads(
+        self,
+        payload: Dict[str, Any],
+        mip003_schema: Optional[List[Dict[str, Any]]]
+    ) -> Tuple[Dict[str, str], Dict[str, Tuple[str, bytes, str]], List[str]]:
+        """Prepare form data and files for Kodosumi request based on MIP003 schema."""
+        if not mip003_schema:
+            return payload, {}, []
+
+        field_map = {field.get('id'): field for field in mip003_schema if field.get('id')}
+        form_data: Dict[str, str] = {}
+        files_payload: Dict[str, Tuple[str, bytes, str]] = {}
+        errors: List[str] = []
+
+        for field_id, field in field_map.items():
+            if field_id not in payload:
+                continue
+
+            field_type = field.get('type')
+            value = payload[field_id]
+
+            if field_type == 'file':
+                file_url = value.strip() if isinstance(value, str) else ''
+                if not file_url:
+                    errors.append(f"{field_id}: file URL is missing or empty")
+                    continue
+
+                content, filename, content_type, download_error = await self._download_file(field_id, file_url)
+                if download_error:
+                    errors.append(f"{field_id}: {download_error}")
+                    continue
+
+                files_payload[field_id] = (filename, content, content_type)
+            else:
+                form_data[field_id] = self._serialize_form_value(value)
+
+        return form_data, files_payload, errors
+
+    async def _download_file(
+        self,
+        field_id: str,
+        file_url: str
+    ) -> Tuple[Optional[bytes], Optional[str], Optional[str], Optional[str]]:
+        """Download a file from the provided URL so it can be uploaded to Kodosumi."""
+        logger.info(f"Downloading file for field {field_id} from {file_url}")
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(file_url, timeout=60.0)
+                response.raise_for_status()
+                content = response.content
+                headers = response.headers
+
+            parsed = urlparse(file_url)
+            filename = os.path.basename(parsed.path) or f"{field_id}.bin"
+            content_type = headers.get('Content-Type') or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+            return content, filename, content_type, None
+        except Exception as exc:
+            logger.error(f"Failed to download file for field {field_id} from {file_url}: {exc}")
+            return None, None, None, str(exc)
+
+    def _serialize_form_value(self, value: Any) -> str:
+        """Serialize non-file values for form submission."""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            return ""
+        return str(value)
+
     async def get_flow_schema(self, conn: asyncpg.Connection, flow_uid: str) -> Optional[List[Dict[str, Any]]]:
         """Get the MIP003 schema for a flow."""
         try:
@@ -277,32 +347,42 @@ class KodosumiStarter:
 
             async with httpx.AsyncClient() as client:
                 headers = {
-                    'KODOSUMI_API_KEY': api_key,
-                    'Content-Type': 'application/json'
+                    'KODOSUMI_API_KEY': api_key
                 }
-                
-                # Log the full request details for debugging
-                # Last-resort fix for model_family field
-                logger.info(f"Checking model_family before fix: {payload.get('model_family')} (type: {type(payload.get('model_family'))})")
-                if 'model_family' in payload and isinstance(payload['model_family'], list):
-                    logger.info(f"model_family is a list with {len(payload['model_family'])} items")
-                    if payload['model_family']:
-                        # If it's still a list of strings, take the first one
-                        payload['model_family'] = str(payload['model_family'][0])
-                        logger.warning(f"Last-resort conversion: model_family converted to string: {payload['model_family']}")
-                
-                logger.info(f"Request headers: {headers}")
-                if session_cookie:
-                    logger.info("Including session cookie for Kodosumi request")
-                logger.info(f"Request payload type: {type(payload)}")
-                logger.info(f"Request payload: {json.dumps(payload)}")
-                
+
+                # Prepare payloads (handles file uploads when present)
+                form_data, files_payload, file_errors = await self._prepare_payloads(payload, schema)
+                if file_errors:
+                    error_message = "; ".join(file_errors)
+                    logger.error(f"File preparation errors for job {job['job_id']}: {error_message}")
+                    return None, error_message
+
+                # Determine request style based on presence of file uploads
+                request_kwargs = {
+                    "cookies": cookies,
+                    "timeout": 30.0
+                }
+
+                if files_payload:
+                    if session_cookie:
+                        logger.info("Including session cookie for Kodosumi request")
+                    logger.info("Sending multipart/form-data request with files")
+                    logger.info(f"Request form fields: {form_data}")
+                    request_kwargs["data"] = form_data
+                    request_kwargs["files"] = files_payload
+                else:
+                    headers['Content-Type'] = 'application/json'
+                    logger.info(f"Request headers: {headers}")
+                    if session_cookie:
+                        logger.info("Including session cookie for Kodosumi request")
+                    logger.info(f"Request payload type: {type(payload)}")
+                    logger.info(f"Request payload: {json.dumps(payload)}")
+                    request_kwargs["json"] = payload
+
                 response = await client.post(
                     kodosumi_url,
                     headers=headers,
-                    json=payload,
-                    cookies=cookies,
-                    timeout=30.0
+                    **request_kwargs
                 )
                 
                 if response.status_code == 200:
