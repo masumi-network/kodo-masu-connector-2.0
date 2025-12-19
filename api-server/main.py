@@ -559,13 +559,14 @@ async def check_job_status(
             and job.get("waiting_for_start_in_kodosumi", False)
             and job.get("kodosumi_start_attempts", 0) >= MAX_START_ATTEMPTS
         ):
+            failure_message = job.get("message") or "Failed to start agent job"
             # This job failed to start in Kodosumi after max attempts
             response = StatusResponse(
                 status_id=status_identifier,
                 job_id=job_id,
                 status="failed",  # Return "failed" per MIP003 spec
-                message=user_friendly_message or "Failed to start agent job",
-                result=job.get("message"),
+                message=failure_message,
+                result=None,
                 reasoning=None
             )
         else:

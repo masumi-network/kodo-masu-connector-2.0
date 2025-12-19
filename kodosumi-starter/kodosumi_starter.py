@@ -13,7 +13,7 @@ import httpx
 import logging
 import os
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
 from cron_logger import CronExecutionLogger
 
@@ -61,21 +61,23 @@ class KodosumiStarter:
         
         return f"postgresql://{user}:{password}@{host}:{port}/{database}"
     
-    async def get_latest_api_key(self, conn: asyncpg.Connection) -> Optional[str]:
-        """Get the latest API key from the database."""
+    async def get_latest_credentials(self, conn: asyncpg.Connection) -> Tuple[Optional[str], Optional[str]]:
+        """Get the latest API key and session cookie from the database."""
         try:
             query = """
-                SELECT api_key FROM api_keys 
+                SELECT api_key, session_cookie FROM api_keys 
                 ORDER BY created_at DESC 
                 LIMIT 1
             """
             row = await conn.fetchrow(query)
             if row:
-                return row['api_key']
-            return None
+                api_key = row['api_key']
+                session_cookie = row['session_cookie'] if 'session_cookie' in row else None
+                return api_key, session_cookie
+            return None, None
         except Exception as e:
             logger.error(f"Failed to get latest API key: {e}")
-            return None
+            return None, None
     
     async def get_jobs_waiting_for_kodosumi(self, conn: asyncpg.Connection) -> List[Dict[str, Any]]:
         """Get all jobs that are waiting to be started in Kodosumi."""
@@ -168,8 +170,48 @@ class KodosumiStarter:
             logger.error(f"Failed to get schema for flow {flow_uid}: {e}")
             return None
 
-    async def start_job_in_kodosumi(self, job: Dict[str, Any], api_key: str, conn: asyncpg.Connection) -> Optional[str]:
-        """Start a job in Kodosumi and return the flow identifier (fid)."""
+    def _extract_error_message(self, response: httpx.Response, payload: Optional[Dict[str, Any]] = None) -> str:
+        """Extract a human-readable error message from a Kodosumi response."""
+        data = payload
+        if data is None:
+            try:
+                data = response.json()
+            except Exception:
+                data = None
+
+        if isinstance(data, dict):
+            errors = data.get("errors")
+            if isinstance(errors, dict) and errors:
+                parts = []
+                for field, messages in errors.items():
+                    if isinstance(messages, list):
+                        for message in messages:
+                            parts.append(f"{field}: {message}")
+                    else:
+                        parts.append(f"{field}: {messages}")
+                if parts:
+                    return "Kodosumi error: " + "; ".join(parts)
+
+            detail = data.get("detail")
+            if detail:
+                return f"Kodosumi error: {detail}"
+
+        text = response.text.strip()
+        status = response.status_code
+        if text:
+            preview = text if len(text) <= 500 else f"{text[:497]}..."
+            return f"Kodosumi error (status {status}): {preview}"
+
+        return f"Kodosumi error (status {status})"
+
+    async def start_job_in_kodosumi(
+        self,
+        job: Dict[str, Any],
+        api_key: str,
+        session_cookie: Optional[str],
+        conn: asyncpg.Connection
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Start a job in Kodosumi and return the flow identifier (fid) and optional error message."""
         try:
             # Use the flow URL from the database if available
             if job.get('flow_url'):
@@ -231,6 +273,8 @@ class KodosumiStarter:
             logger.info(f"Sending payload: {payload}")
             
             # Make the request to Kodosumi using the API key
+            cookies = {'kodosumi_jwt': session_cookie} if session_cookie else None
+
             async with httpx.AsyncClient() as client:
                 headers = {
                     'KODOSUMI_API_KEY': api_key,
@@ -248,6 +292,8 @@ class KodosumiStarter:
                         logger.warning(f"Last-resort conversion: model_family converted to string: {payload['model_family']}")
                 
                 logger.info(f"Request headers: {headers}")
+                if session_cookie:
+                    logger.info("Including session cookie for Kodosumi request")
                 logger.info(f"Request payload type: {type(payload)}")
                 logger.info(f"Request payload: {json.dumps(payload)}")
                 
@@ -255,6 +301,7 @@ class KodosumiStarter:
                     kodosumi_url,
                     headers=headers,
                     json=payload,
+                    cookies=cookies,
                     timeout=30.0
                 )
                 
@@ -264,17 +311,25 @@ class KodosumiStarter:
                     
                     if fid:
                         logger.info(f"Successfully started job {job['job_id']} in Kodosumi with fid: {fid}")
-                        return fid
+                        return fid, None
                     else:
-                        logger.warning(f"Kodosumi response for job {job['job_id']} did not contain 'result' field: {result}")
-                        return None
+                        error_message = self._extract_error_message(response, result)
+                        logger.warning(
+                            f"Kodosumi response for job {job['job_id']} did not contain 'result' field."
+                            f" Error: {error_message}"
+                        )
+                        return None, error_message
                 else:
-                    logger.error(f"Failed to start job {job['job_id']} in Kodosumi. Status: {response.status_code}, Response: {response.text}")
-                    return None
+                    error_message = self._extract_error_message(response)
+                    logger.error(
+                        f"Failed to start job {job['job_id']} in Kodosumi. "
+                        f"Status: {response.status_code}, Error: {error_message}"
+                    )
+                    return None, error_message
                     
         except Exception as e:
             logger.error(f"Error starting job {job['job_id']} in Kodosumi: {e}")
-            return None
+            return None, str(e)
     
     async def update_job_with_fid(self, conn: asyncpg.Connection, job_id: str, fid: str) -> bool:
         """Update job with Kodosumi flow identifier and set waiting_for_start_in_kodosumi to false."""
@@ -299,6 +354,25 @@ class KodosumiStarter:
                 
         except Exception as e:
             logger.error(f"Failed to update job {job_id} with fid {fid}: {e}")
+            return False
+
+    async def update_job_message(self, conn: asyncpg.Connection, job_id: str, message: str) -> bool:
+        """Update the job message for visibility in status endpoints and UI."""
+        try:
+            query = """
+                UPDATE jobs
+                SET message = $2,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = $1::uuid
+            """
+            result = await conn.execute(query, job_id, message)
+            if result == "UPDATE 1":
+                logger.info(f"Updated job {job_id} message to: {message}")
+                return True
+            logger.warning(f"No rows updated when setting message for job {job_id}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to update message for job {job_id}: {e}")
             return False
     
     async def increment_retry_count(self, conn: asyncpg.Connection, job_id: str) -> bool:
@@ -362,14 +436,18 @@ class KodosumiStarter:
             # Connect to database
             conn = await asyncpg.connect(self.database_url)
             
-            # Get latest API key
-            api_key = await self.get_latest_api_key(conn)
+            # Get latest API credentials
+            api_key, session_cookie = await self.get_latest_credentials(conn)
             if not api_key:
                 logger.warning("No API key found in database. Cannot start jobs in Kodosumi.")
                 await conn.close()
                 return
             
             logger.info(f"Using API key: {api_key[:20]}...")
+            if session_cookie:
+                logger.info("Session cookie available for job start requests")
+            else:
+                logger.warning("No session cookie available; Kodosumi may reject requests")
             
             # Get jobs waiting to be started in Kodosumi
             waiting_jobs = await self.get_jobs_waiting_for_kodosumi(conn)
@@ -406,7 +484,7 @@ class KodosumiStarter:
                 )
                 
                 # Start job in Kodosumi
-                fid = await self.start_job_in_kodosumi(job, api_key, conn)
+                fid, error_message = await self.start_job_in_kodosumi(job, api_key, session_cookie, conn)
                 
                 if fid:
                     # Update job with the Kodosumi flow identifier
@@ -423,20 +501,26 @@ class KodosumiStarter:
                         f"Failed to start job {job_id} in Kodosumi "
                         f"(attempt {attempts + 1}/{MAX_START_ATTEMPTS})"
                     )
+
+                    # Persist the latest error message so it is visible via status/API
+                    if error_message:
+                        await self.update_job_message(conn, job_id, error_message)
                     
                     # Increment retry count
                     await self.increment_retry_count(conn, job_id)
                     
                     # Check if this was the 5th attempt
                     if attempts + 1 >= MAX_START_ATTEMPTS:
-                        error_msg = (
+                        detailed_error = (
                             f"Failed to start job in Kodosumi after "
                             f"{MAX_START_ATTEMPTS} attempts"
                         )
-                        await self.mark_job_as_error(conn, job_id, error_msg)
+                        if error_message:
+                            detailed_error = f"{detailed_error}. Last error: {error_message}"
+                        await self.mark_job_as_error(conn, job_id, detailed_error)
                         logger.error(
                             f"Job {job_id} marked as error after "
-                            f"{MAX_START_ATTEMPTS} failed attempts"
+                            f"{MAX_START_ATTEMPTS} failed attempts: {detailed_error}"
                         )
             
             await conn.close()
