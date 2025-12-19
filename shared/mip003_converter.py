@@ -131,22 +131,8 @@ class MIP003Converter:
 
         # Handle file inputs
         elif element.get('type') == 'file':
-            accept = element.get('accept')
-            if accept:
-                data['accept'] = accept
-
-            max_size = element.get('maxSize') or element.get('max_size')
-            if max_size:
-                data['maxSize'] = str(max_size)
-
-            # MIP003 output format for files defaults to URL
+            # MIP003 expects only an outputFormat hint for file inputs
             data['outputFormat'] = element.get('outputFormat', 'url')
-
-            # Preserve multiple/directory hints if provided
-            if element.get('multiple') is not None:
-                data['multiple'] = str(bool(element['multiple'])).lower()
-            if element.get('directory') is not None:
-                data['directory'] = str(bool(element['directory'])).lower()
     
     def _add_validations(self, element: Dict[str, Any], mip003_element: Dict[str, Any]):
         """
