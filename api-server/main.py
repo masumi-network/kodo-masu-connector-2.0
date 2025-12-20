@@ -6,6 +6,7 @@ import logging
 import uvicorn
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
+import uuid
 from enum import Enum
 from urllib.parse import unquote
 import os
@@ -14,6 +15,7 @@ import httpx
 import json
 import re
 from html import unescape
+import hashlib
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from masumi import create_masumi_input_hash
@@ -30,6 +32,7 @@ from models import (
 )
 from middleware import (
     RobustnessMiddleware,
+    HealthCheckMiddleware,
     setup_rate_limiting, metrics_endpoint, limiter
 )
 from cache import flow_cache, response_cache, schema_cache, not_found_cache
@@ -269,6 +272,7 @@ app = FastAPI(
 rate_limits = setup_rate_limiting(app)
 
 # Add middlewares
+app.add_middleware(HealthCheckMiddleware)  # Process health checks first
 app.add_middleware(RobustnessMiddleware, request_timeout=30.0)
 app.add_middleware(
     CORSMiddleware,
@@ -491,7 +495,7 @@ async def check_job_status(
         cache_key = f"{base_identifier}:{job_id}"
         cached_response = await response_cache.get("status", {"key": cache_key})
         if cached_response:
-            return cached_response
+            return JSONResponse(content=cached_response)
 
         # Check not-found cache for 404 responses
         not_found_response = await not_found_cache.get("not_found", {"key": cache_key})
@@ -525,8 +529,111 @@ async def check_job_status(
             })
             raise HTTPException(status_code=404, detail="Job not found for this flow")
         
+        def build_status_id(job_record: Dict[str, Any]) -> str:
+            """Create a deterministic status identifier for each status change."""
+            job_id_value = job_record.get("job_id")
+            try:
+                job_uuid = uuid.UUID(str(job_id_value))
+            except (ValueError, TypeError):
+                job_uuid = None
+
+            updated_at = job_record.get("updated_at")
+            if isinstance(updated_at, datetime):
+                updated_marker = updated_at.isoformat()
+            else:
+                updated_marker = str(updated_at) if updated_at is not None else ""
+
+            status_marker = job_record.get("status", "")
+            namespace = job_uuid or uuid.NAMESPACE_URL
+            seed = f"{job_id_value}:{status_marker}:{updated_marker}"
+            return str(uuid.uuid5(namespace, seed))
+
+        def build_input_schema_from_result(job_record: Dict[str, Any]) -> Optional[InputSchemaResponse]:
+            """Extract lock-driven input fields when job awaits human input."""
+            if job_record.get("status") != "awaiting_input":
+                return None
+
+            result_payload = job_record.get("result") or {}
+            if not isinstance(result_payload, dict):
+                return None
+
+            lock_section = result_payload.get("kodosumi_locks")
+            if not isinstance(lock_section, dict):
+                return None
+
+            locks = lock_section.get("locks")
+            if not isinstance(locks, list):
+                return None
+
+            type_map = {
+                "text": "string",
+                "textarea": "textarea",
+                "boolean": "boolean",
+                "checkbox": "boolean",
+                "number": "number",
+            }
+
+            collected_fields: List[InputField] = []
+            for lock in locks:
+                lock_id = lock.get("lock_id")
+                if not lock_id:
+                    logger.warning("Lock entry missing lock_id; skipping")
+                    continue
+
+                schema = lock.get("schema")
+                if not isinstance(schema, list):
+                    continue
+
+                for element in schema:
+                    if not isinstance(element, dict):
+                        continue
+                    element_type = element.get("type")
+                    if not element_type:
+                        continue
+
+                    normalized_type = element_type.lower()
+                    if normalized_type in {"submit", "cancel", "markdown"}:
+                        continue
+
+                    field_id = element.get("name") or element.get("id")
+                    if not field_id:
+                        continue
+
+                    field_type = type_map.get(normalized_type, normalized_type)
+                    data: Dict[str, Any] = {}
+                    if element.get("label"):
+                        data["label"] = element["label"]
+                    if element.get("placeholder"):
+                        data["placeholder"] = element["placeholder"]
+                    if element.get("value") is not None:
+                        data["value"] = element["value"]
+                    if element.get("description"):
+                        data["description"] = element["description"]
+
+                    data["lock_id"] = lock_id
+
+                    validations: List[Dict[str, Any]] = []
+                    raw_validations = element.get("validations")
+                    if isinstance(raw_validations, list):
+                        validations = raw_validations
+
+                    collected_fields.append(
+                        InputField(
+                            id=str(field_id),
+                            type=field_type,
+                            name=element.get("label") or element.get("name"),
+                            data=data or None,
+                            validations=validations
+                        )
+                    )
+
+            if not collected_fields:
+                return None
+            return InputSchemaResponse(input_data=collected_fields)
+        
         job_id_str = str(job["job_id"])
-        status_identifier = job.get("current_status_id") or job_id_str
+        raw_status_identifier = job.get("current_status_id")
+        status_identifier = str(raw_status_identifier) if raw_status_identifier else build_status_id(job)
         input_fields: Optional[List[InputField]] = None
         input_schema_response: Optional[InputSchemaResponse] = None
         pending_request: Optional[Dict[str, Any]] = None
@@ -548,6 +655,11 @@ async def check_job_status(
                         status_identifier = pending_request.get("status_id", status_identifier)
                     except Exception as exc:
                         logger.error(f"Unable to build input schema for job {job_id_str}: {exc}")
+
+        if input_schema_response is None:
+            fallback_schema = build_input_schema_from_result(job)
+            if fallback_schema:
+                input_schema_response = fallback_schema
 
         user_friendly_message = _build_user_friendly_message(job, pending_request)
 
@@ -625,13 +737,13 @@ async def check_job_status(
         if input_fields:
             response.input_schema = input_schema_response
 
-        response_payload = response.model_dump(by_alias=True)
+        response_payload = response.model_dump(by_alias=True, exclude_none=True)
         
         # Cache response if job is completed or failed (won't change anymore)
         if response.status in ["completed", "failed"]:
             await response_cache.set("status", {"key": cache_key}, response_payload)
         
-        return response_payload
+        return JSONResponse(content=response_payload)
         
     except HTTPException:
         raise
@@ -687,8 +799,8 @@ async def provide_input(
                 detail="Pending input request not found or already resolved"
             )
 
-        kodosumi_api_key = await db_manager.get_latest_api_key()
-        if not kodosumi_api_key:
+        api_key, session_cookie = await db_manager.get_latest_kodosumi_credentials()
+        if not api_key:
             raise HTTPException(status_code=503, detail="No Kodosumi API key available to submit input")
 
         kodosumi_fid = pending_request.get("kodosumi_fid")
@@ -699,14 +811,17 @@ async def provide_input(
         lock_url = f"{config.KODOSUMI_SERVER_URL.rstrip('/')}/lock/{kodosumi_fid}/{lock_identifier}"
 
         try:
+            cookies = {'kodosumi_jwt': session_cookie} if session_cookie else None
+
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     lock_url,
                     headers={
-                        "KODOSUMI_API_KEY": kodosumi_api_key,
+                        "KODOSUMI_API_KEY": api_key,
                         "Content-Type": "application/json",
                     },
                     json=input_request.input_data,
+                    cookies=cookies,
                     timeout=30.0,
                 )
         except httpx.HTTPError as exc:
@@ -758,10 +873,15 @@ async def provide_input(
                 "input hash response will be empty"
             )
 
+        serialized_input = json.dumps(input_request.input_data, sort_keys=True, separators=(",", ":"))
+        secure_input_hash = f"sha256:{hashlib.sha256(serialized_input.encode('utf-8')).hexdigest()}"
+        signature_seed = f"{secure_input_hash}:{agent_identifier}:{input_request.job_id}"
+        signature = hashlib.sha256(signature_seed.encode('utf-8')).hexdigest()
+
         return ProvideInputResponse(
             status="success",
-            input_hash=input_hash_value or "",
-            signature="to-be-replaced-in-future"
+            input_hash=input_hash_value or secure_input_hash,
+            signature=signature
         )
         
     except HTTPException:

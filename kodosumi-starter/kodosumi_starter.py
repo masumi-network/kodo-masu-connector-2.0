@@ -13,6 +13,7 @@ import httpx
 import logging
 import os
 import json
+import math
 import mimetypes
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
@@ -28,6 +29,18 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def _load_chunk_size() -> int:
+    raw_value = os.getenv("KODOSUMI_FILES_CHUNK_SIZE", str(512 * 1024))
+    try:
+        size = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid KODOSUMI_FILES_CHUNK_SIZE '%s', defaulting to 524288", raw_value)
+        size = 512 * 1024
+    # Enforce valid bounds (1 byte .. 1 MiB)
+    return max(1, min(size, 1024 * 1024))
+
+UPLOAD_CHUNK_SIZE = _load_chunk_size()
 
 def _load_max_attempts() -> int:
     """Fetch the maximum number of start attempts from the environment."""
@@ -156,41 +169,170 @@ class KodosumiStarter:
 
     async def _prepare_payloads(
         self,
+        client: httpx.AsyncClient,
         payload: Dict[str, Any],
-        mip003_schema: Optional[List[Dict[str, Any]]]
-    ) -> Tuple[Dict[str, str], Dict[str, Tuple[str, bytes, str]], List[str]]:
-        """Prepare form data and files for Kodosumi request based on MIP003 schema."""
+        mip003_schema: Optional[List[Dict[str, Any]]],
+        api_key: str,
+        session_cookie: Optional[str]
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """
+        Prepare payload for Kodosumi requests. When file fields are present we upload
+        the bytes via the Files API and replace the original values with the JSON
+        references Kodosumi expects (batchId/items structure).
+        """
         if not mip003_schema:
-            return payload, {}, []
+            # Nothing to transform
+            return payload, []
 
         field_map = {field.get('id'): field for field in mip003_schema if field.get('id')}
-        form_data: Dict[str, str] = {}
-        files_payload: Dict[str, Tuple[str, bytes, str]] = {}
+        prepared_payload = payload.copy()
         errors: List[str] = []
 
+        cookies = {'kodosumi_jwt': session_cookie} if session_cookie else None
+        batch_id: Optional[str] = None
+
         for field_id, field in field_map.items():
-            if field_id not in payload:
+            if field_id not in prepared_payload:
                 continue
 
-            field_type = field.get('type')
-            value = payload[field_id]
+            if field.get('type') != 'file':
+                continue
 
-            if field_type == 'file':
-                file_url = value.strip() if isinstance(value, str) else ''
-                if not file_url:
-                    errors.append(f"{field_id}: file URL is missing or empty")
-                    continue
+            original_value = prepared_payload[field_id]
+            file_url = original_value.strip() if isinstance(original_value, str) else ''
+            if not file_url:
+                errors.append(f"{field_id}: file URL is missing or empty")
+                continue
 
-                content, filename, content_type, download_error = await self._download_file(field_id, file_url)
-                if download_error:
-                    errors.append(f"{field_id}: {download_error}")
-                    continue
+            content, filename, _, download_error = await self._download_file(field_id, file_url)
+            if download_error:
+                errors.append(f"{field_id}: {download_error}")
+                continue
+            if content is None or filename is None:
+                errors.append(f"{field_id}: failed to download file bytes")
+                continue
 
-                files_payload[field_id] = (filename, content, content_type)
-            else:
-                form_data[field_id] = self._serialize_form_value(value)
+            try:
+                if batch_id is None:
+                    batch_id = await self._init_file_batch(client, api_key, cookies)
+                upload_id, total_chunks = await self._upload_file_via_api(
+                    client,
+                    batch_id,
+                    filename,
+                    content,
+                    api_key,
+                    cookies
+                )
+            except Exception as exc:
+                errors.append(f"{field_id}: {exc}")
+                continue
 
-        return form_data, files_payload, errors
+            prepared_payload[field_id] = json.dumps({
+                "batchId": batch_id,
+                "items": {
+                    upload_id: {
+                        "filename": filename,
+                        "totalChunks": total_chunks
+                    }
+                }
+            })
+
+        return prepared_payload, errors
+
+    async def _init_file_batch(
+        self,
+        client: httpx.AsyncClient,
+        api_key: str,
+        cookies: Optional[Dict[str, str]]
+    ) -> str:
+        """Initialize a batch upload session and return the batch_id."""
+        url = f"{self.kodosumi_server_url}/files/init_batch"
+        response = await client.post(
+            url,
+            headers={'KODOSUMI_API_KEY': api_key},
+            cookies=cookies,
+            timeout=30.0
+        )
+        response.raise_for_status()
+        data = response.json()
+        batch_id = data.get("batch_id")
+        if not batch_id:
+            raise RuntimeError("files/init_batch response missing batch_id")
+        logger.info(f"Initialized file batch {batch_id}")
+        return batch_id
+
+    async def _upload_file_via_api(
+        self,
+        client: httpx.AsyncClient,
+        batch_id: str,
+        filename: str,
+        content: bytes,
+        api_key: str,
+        cookies: Optional[Dict[str, str]]
+    ) -> Tuple[str, int]:
+        """
+        Upload a single file to Kodosumi via the Files API.
+        Returns (upload_id, total_chunks).
+        """
+        total_chunks = max(1, math.ceil(len(content) / (1024 * 1024)))
+        chunk_size = max(1, min(UPLOAD_CHUNK_SIZE, 1024 * 1024))
+        total_chunks = max(1, math.ceil(len(content) / chunk_size))
+        init_payload = {
+            "filename": filename,
+            "total_chunks": total_chunks,
+            "batch_id": batch_id
+        }
+        init_url = f"{self.kodosumi_server_url}/files/init"
+        init_resp = await client.post(
+            init_url,
+            headers={'KODOSUMI_API_KEY': api_key},
+            cookies=cookies,
+            json=init_payload,
+            timeout=30.0
+        )
+        init_resp.raise_for_status()
+        upload_id = init_resp.json().get("upload_id")
+        if not upload_id:
+            raise RuntimeError("files/init response missing upload_id")
+
+        chunk_url = f"{self.kodosumi_server_url}/files/chunk"
+        for chunk_number in range(total_chunks):
+            start = chunk_number * chunk_size
+            end = start + chunk_size
+            chunk_bytes = content[start:end]
+            if not chunk_bytes:
+                raise RuntimeError(f"Chunk {chunk_number} read empty data")
+
+            form_data = {
+                "upload_id": upload_id,
+                "chunk_number": str(chunk_number)
+            }
+            files = {
+                "chunk": (
+                    f"chunk_{chunk_number}",
+                    chunk_bytes,
+                    "application/octet-stream"
+                )
+            }
+            chunk_resp = await client.post(
+                chunk_url,
+                headers={'KODOSUMI_API_KEY': api_key},
+                cookies=cookies,
+                data=form_data,
+                files=files,
+                timeout=30.0
+            )
+            if chunk_resp.status_code == 413:
+                raise RuntimeError(
+                    "Uploaded chunk exceeded allowed size (HTTP 413). "
+                    "Try reducing KODOSUMI_FILES_CHUNK_SIZE."
+                )
+            chunk_resp.raise_for_status()
+
+        logger.info(
+            f"Uploaded file '{filename}' via Files API with upload_id {upload_id}"
+        )
+        return upload_id, total_chunks
 
     async def _download_file(
         self,
@@ -340,8 +482,6 @@ class KodosumiStarter:
                     payload['model_family'] = ""
                     logger.info("Converted empty model_family list to empty string")
             
-            logger.info(f"Sending payload: {payload}")
-            
             # Make the request to Kodosumi using the API key
             cookies = {'kodosumi_jwt': session_cookie} if session_cookie else None
 
@@ -350,39 +490,29 @@ class KodosumiStarter:
                     'KODOSUMI_API_KEY': api_key
                 }
 
-                # Prepare payloads (handles file uploads when present)
-                form_data, files_payload, file_errors = await self._prepare_payloads(payload, schema)
+                prepared_payload, file_errors = await self._prepare_payloads(
+                    client,
+                    payload,
+                    schema,
+                    api_key,
+                    session_cookie
+                )
                 if file_errors:
                     error_message = "; ".join(file_errors)
                     logger.error(f"File preparation errors for job {job['job_id']}: {error_message}")
                     return None, error_message
 
-                # Determine request style based on presence of file uploads
-                request_kwargs = {
-                    "cookies": cookies,
-                    "timeout": 30.0
-                }
-
-                if files_payload:
-                    if session_cookie:
-                        logger.info("Including session cookie for Kodosumi request")
-                    logger.info("Sending multipart/form-data request with files")
-                    logger.info(f"Request form fields: {form_data}")
-                    request_kwargs["data"] = form_data
-                    request_kwargs["files"] = files_payload
-                else:
-                    headers['Content-Type'] = 'application/json'
-                    logger.info(f"Request headers: {headers}")
-                    if session_cookie:
-                        logger.info("Including session cookie for Kodosumi request")
-                    logger.info(f"Request payload type: {type(payload)}")
-                    logger.info(f"Request payload: {json.dumps(payload)}")
-                    request_kwargs["json"] = payload
+                headers['Content-Type'] = 'application/json'
+                if session_cookie:
+                    logger.info("Including session cookie for Kodosumi request")
+                logger.info(f"Prepared payload: {prepared_payload}")
 
                 response = await client.post(
                     kodosumi_url,
                     headers=headers,
-                    **request_kwargs
+                    cookies=cookies,
+                    timeout=30.0,
+                    json=prepared_payload
                 )
                 
                 if response.status_code == 200:

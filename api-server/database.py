@@ -1,6 +1,6 @@
 import asyncio
 import asyncpg
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
 from config import config
@@ -104,6 +104,21 @@ class DatabaseManager:
                 "SELECT uid, summary, description, author, organization, tags, url_identifier FROM flows WHERE deprecated IS NOT TRUE ORDER BY summary"
             )
             return [dict(row) for row in rows]
+
+    async def get_latest_kodosumi_credentials(self) -> Tuple[Optional[str], Optional[str]]:
+        """Fetch the most recent Kodosumi API key and session cookie."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT api_key, session_cookie
+                FROM api_keys
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+            if not row:
+                return None, None
+            return row["api_key"], row.get("session_cookie")
     
     async def create_job(self, flow_uid: str, input_data: Dict[str, Any], 
                         payment_data: Dict[str, Any], 

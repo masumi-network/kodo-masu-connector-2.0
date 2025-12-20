@@ -231,26 +231,34 @@ class KodosumiStatusChecker:
             return False
     
     async def get_latest_api_key(self, conn: asyncpg.Connection) -> Optional[str]:
-        """Get the latest API key from the database."""
+        """Backward-compatible wrapper returning only the API key."""
+        api_key, _ = await self.get_latest_credentials(conn)
+        return api_key
+
+    async def get_latest_credentials(self, conn: asyncpg.Connection) -> Tuple[Optional[str], Optional[str]]:
+        """Get the latest API key and session cookie from the database."""
         try:
             query = """
-                SELECT api_key FROM api_keys 
+                SELECT api_key, session_cookie FROM api_keys 
                 ORDER BY created_at DESC 
                 LIMIT 1
             """
             row = await conn.fetchrow(query)
             if row:
-                return row['api_key']
-            return None
+                api_key = row['api_key']
+                session_cookie = row['session_cookie'] if 'session_cookie' in row else None
+                return api_key, session_cookie
+            return None, None
         except Exception as e:
             logger.error(f"Failed to get latest API key: {e}")
-            return None
+            return None, None
     
     async def get_running_jobs_with_fid(self, conn: asyncpg.Connection) -> List[Dict[str, Any]]:
         """Get all jobs that are running and have a Kodosumi FID."""
         query = f"""
             SELECT j.job_id, j.flow_uid, j.status, 
                    j.result->>'kodosumi_fid' as kodosumi_fid,
+                   j.result,
                    j.payment_data, j.input_data, j.identifier_from_purchaser,
                    j.agent_identifier_used, j.payment_required,
                    j.created_at, j.updated_at, j.timeout_attempts, j.not_found_attempts,
@@ -273,12 +281,14 @@ class KodosumiStatusChecker:
             # Parse JSON fields
             payment_data = json.loads(row['payment_data']) if row['payment_data'] else {}
             input_data = json.loads(row['input_data']) if row['input_data'] else {}
+            result_data = json.loads(row['result']) if row['result'] else {}
             
             jobs.append({
                 'job_id': row['job_id'],
                 'flow_uid': row['flow_uid'],
                 'status': row['status'],
                 'kodosumi_fid': row['kodosumi_fid'],
+                'result': result_data,
                 'flow_summary': row['flow_summary'],
                 'payment_data': payment_data,
                 'input_data': input_data,
@@ -294,7 +304,7 @@ class KodosumiStatusChecker:
         
         return jobs
     
-    async def check_job_status(self, fid: str, api_key: str) -> Optional[Dict[str, Any]]:
+    async def check_job_status(self, fid: str, api_key: str, session_cookie: Optional[str]) -> Optional[Dict[str, Any]]:
         """Check the status of a job in Kodosumi."""
         try:
             # Construct the status URL (removed extended=true as it causes timeouts)
@@ -303,6 +313,8 @@ class KodosumiStatusChecker:
             logger.info(f"Checking status for FID {fid} at: {status_url}")
             
             # Make the request to Kodosumi using the API key
+            cookies = {'kodosumi_jwt': session_cookie} if session_cookie else None
+
             async with httpx.AsyncClient() as client:
                 headers = {
                     'KODOSUMI_API_KEY': api_key,
@@ -312,6 +324,7 @@ class KodosumiStatusChecker:
                 response = await client.get(
                     status_url,
                     headers=headers,
+                    cookies=cookies,
                     timeout=30.0
                 )
                 
@@ -440,6 +453,94 @@ class KodosumiStatusChecker:
         
         # Fallback to direct access (old format)
         return payment_data.get('blockchainIdentifier')
+
+    async def fetch_lock_schema(
+        self,
+        fid: str,
+        lid: str,
+        api_key: str,
+        session_cookie: Optional[str]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Fetch the lock schema (form elements) for a given lock."""
+        url = f"{self.kodosumi_server_url}/lock/{fid}/{lid}"
+        cookies = {'kodosumi_jwt': session_cookie} if session_cookie else None
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    url,
+                    headers={'KODOSUMI_API_KEY': api_key},
+                    cookies=cookies,
+                    timeout=30.0
+                )
+                response.raise_for_status()
+                schema = response.json()
+                logger.info(f"Fetched lock schema for fid={fid}, lid={lid}")
+                return schema
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                f"Failed to fetch lock schema for fid={fid}, lid={lid}: "
+                f"HTTP {exc.response.status_code} - {exc.response.text}"
+            )
+        except Exception as exc:
+            logger.error(f"Error fetching lock schema for fid={fid}, lid={lid}: {exc}")
+        return None
+
+    async def mark_job_awaiting_input(
+        self,
+        conn: asyncpg.Connection,
+        job_id: str,
+        locks: List[Dict[str, Any]]
+    ) -> None:
+        """Update the job to awaiting_input state and persist lock metadata."""
+        message = "Awaiting human input in Kodosumi"
+        lock_payload = {
+            "locks": locks
+        }
+        try:
+            await conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'awaiting_input',
+                    message = $2,
+                    result = COALESCE(result, '{}'::jsonb) || $3::jsonb,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = $1::uuid
+                """,
+                job_id,
+                message,
+                json.dumps({"kodosumi_locks": lock_payload})
+            )
+            logger.info(f"Marked job {job_id} as awaiting_input")
+        except Exception as exc:
+            logger.error(f"Failed to mark job {job_id} as awaiting_input: {exc}")
+
+    async def clear_job_lock_state(
+        self,
+        conn: asyncpg.Connection,
+        job_id: str,
+        message: Optional[str] = None
+    ) -> None:
+        """Reset job status to running and clear stored lock metadata."""
+        try:
+            await conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'running',
+                    message = $2,
+                    result = CASE 
+                        WHEN result IS NULL THEN NULL
+                        ELSE result - 'kodosumi_locks'
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = $1::uuid
+                """,
+                job_id,
+                message
+            )
+            logger.info(f"Cleared lock state for job {job_id}")
+        except Exception as exc:
+            logger.error(f"Failed to clear lock state for job {job_id}: {exc}")
 
     def _strip_null_bytes(self, value: Any) -> Tuple[Any, int]:
         """Recursively remove null bytes from strings within nested structures."""
@@ -600,13 +701,17 @@ class KodosumiStatusChecker:
             conn = await asyncpg.connect(self.database_url)
             
             # Get latest Kodosumi API key for status checking
-            kodosumi_api_key = await self.get_latest_api_key(conn)
+            kodosumi_api_key, session_cookie = await self.get_latest_credentials(conn)
             if not kodosumi_api_key:
                 logger.warning("No API key found in database. Cannot check job status.")
                 await conn.close()
                 return
             
             logger.info(f"Using Kodosumi API key: {kodosumi_api_key[:20]}...")
+            if session_cookie:
+                logger.info("Session cookie available for status checks")
+            else:
+                logger.warning("No session cookie available; status checks may fail with 401s")
             
             # Get Masumi payment API key from environment
             payment_api_key = os.getenv('PAYMENT_API_KEY')
@@ -666,7 +771,7 @@ class KodosumiStatusChecker:
                 jobs_processed += 1  # Only count attempts where we actually make a request
 
                 # Check job status in Kodosumi
-                status_result = await self.check_job_status(fid, kodosumi_api_key)
+                status_result = await self.check_job_status(fid, kodosumi_api_key, session_cookie)
                 
                 if status_result:
                     # Check if this was a timeout
@@ -769,6 +874,37 @@ class KodosumiStatusChecker:
                                 logger.error(f"Failed to update completed job {job_id}")
                         else:
                             logger.warning(f"Job {job_id} marked as finished but no final result provided")
+                    elif status == 'awaiting':
+                        locks = status_result.get('locks') or []
+                        if not locks:
+                            logger.info(f"Job {job_id} awaiting input but no lock IDs provided")
+                            continue
+
+                        existing_lock_info = (
+                            (job.get('result') or {})
+                            .get('kodosumi_locks', {})
+                            .get('locks', [])
+                        )
+                        existing_lock_ids = {
+                            lock.get('lock_id') for lock in existing_lock_info if lock.get('lock_id')
+                        }
+                        lock_ids = set(locks)
+
+                        # Only refresh lock metadata when we don't already have the same set
+                        if job['status'] == 'awaiting_input' and lock_ids.issubset(existing_lock_ids):
+                            logger.info(f"Job {job_id} already awaiting input with stored lock metadata")
+                            continue
+
+                        lock_entries: List[Dict[str, Any]] = []
+                        for lid in locks:
+                            schema = await self.fetch_lock_schema(fid, lid, kodosumi_api_key, session_cookie)
+                            lock_entry: Dict[str, Any] = {"lock_id": lid}
+                            if schema is not None:
+                                lock_entry["schema"] = schema
+                            lock_entries.append(lock_entry)
+
+                        await self.mark_job_awaiting_input(conn, job_id, lock_entries)
+                        jobs_processed += 1
                     elif status == 'failed' or status == 'error':
                         # Job failed in Kodosumi
                         logger.warning(f"Job {job_id} failed in Kodosumi with status: {status}")
@@ -779,6 +915,8 @@ class KodosumiStatusChecker:
                             job_id
                         )
                     elif status == 'running':
+                        if job['status'] == 'awaiting_input':
+                            await self.clear_job_lock_state(conn, job_id, "Processing job in Kodosumi")
                         logger.info(f"Job {job_id} is still running in Kodosumi")
                         if await self.update_running_job_progress(conn, job, kodosumi_api_key):
                             jobs_processed += 1

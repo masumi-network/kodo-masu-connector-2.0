@@ -68,7 +68,7 @@ class ProvideInputRequest(BaseModel):
 class ProvideInputResponse(BaseModel):
     status: str = Field(..., description="Status of the input provision")
     input_hash: str = Field(..., description="Hash of the supplemental input payload")
-    signature: str = Field(..., description="Placeholder for future signed inputs")
+    signature: str = Field(..., description="Deterministic signature validating the supplemental input payload")
 
 class AvailabilityResponse(BaseModel):
     status: str = Field(..., description="Server status")
