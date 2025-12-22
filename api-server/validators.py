@@ -6,6 +6,7 @@ matches the expected schema format and constraints.
 """
 
 from typing import Dict, List, Any, Union, Optional
+import mimetypes
 import re
 from urllib.parse import urlparse
 
@@ -213,15 +214,149 @@ def validate_file_field(
     if value is None:
         raise ValidationError(field_id, "File value cannot be null")
 
-    if not isinstance(value, str):
-        raise ValidationError(field_id, f"Expected string URL, got {type(value).__name__}")
-
-    trimmed = value.strip()
-    if not trimmed:
-        raise ValidationError(field_id, "File value cannot be empty")
-
     output_format = field.get('data', {}).get('outputFormat', 'url')
+    if isinstance(output_format, str):
+        output_format = output_format.lower()
+    else:
+        output_format = 'url'
+
+    # Normalise to a list for consistent min/max checks
+    raw_items = value if isinstance(value, list) else [value]
+
     if output_format == 'url':
-        parsed = urlparse(trimmed)
-        if parsed.scheme not in ("http", "https"):
-            raise ValidationError(field_id, "File URL must start with http:// or https://")
+        file_entries: List[Dict[str, Any]] = []
+
+        def _normalise_url_entry(entry: Any) -> Dict[str, Any]:
+            if isinstance(entry, str):
+                trimmed_value = entry.strip()
+                if not trimmed_value:
+                    raise ValidationError(field_id, "File value cannot be empty")
+                return {
+                    "url": trimmed_value,
+                    "name": None,
+                    "size": None,
+                    "type": None
+                }
+            if isinstance(entry, dict):
+                url_value = str(entry.get("url") or entry.get("value") or "").strip()
+                if not url_value:
+                    raise ValidationError(field_id, "File URL is missing or empty")
+                normalised = {
+                    "url": url_value,
+                    "name": entry.get("name"),
+                    "size": entry.get("size"),
+                    "type": entry.get("type") or entry.get("mimeType")
+                }
+                return normalised
+            raise ValidationError(field_id, f"Unsupported file entry type: {type(entry).__name__}")
+
+        for item in raw_items:
+            file_entries.append(_normalise_url_entry(item))
+
+    else:
+        # output_format == "string" (or any other non-url format)
+        file_entries = []
+        for item in raw_items:
+            if not isinstance(item, str):
+                raise ValidationError(field_id, "File value must be a string")
+            trimmed_value = item.strip()
+            if not trimmed_value:
+                raise ValidationError(field_id, "File value cannot be empty")
+            file_entries.append({"value": trimmed_value})
+
+    # Parse validation rules
+    min_files: Optional[int] = None
+    max_files: Optional[int] = None
+    max_size: Optional[int] = None
+    accept_rules: List[str] = []
+
+    for validation in validations:
+        val_type = validation.get("validation")
+        val_value = validation.get("value")
+        if val_type == "min":
+            try:
+                min_files = int(val_value)
+            except (TypeError, ValueError):
+                pass
+        elif val_type == "max":
+            try:
+                max_files = int(val_value)
+            except (TypeError, ValueError):
+                pass
+        elif val_type == "maxSize":
+            try:
+                max_size = int(val_value)
+            except (TypeError, ValueError):
+                pass
+        elif val_type == "accept" and isinstance(val_value, str):
+            accept_rules = [item.strip().lower() for item in val_value.split(",") if item.strip()]
+
+    file_count = len(file_entries)
+    if min_files is not None and file_count < min_files:
+        raise ValidationError(field_id, f"At least {min_files} file(s) required")
+    if max_files is not None and file_count > max_files:
+        raise ValidationError(field_id, f"No more than {max_files} file(s) allowed")
+
+    if output_format == 'url':
+        # Validate individual entries for URL format
+        for entry in file_entries:
+            file_url = entry["url"]
+            parsed = urlparse(file_url)
+            if parsed.scheme not in ("http", "https"):
+                raise ValidationError(field_id, "File URL must start with http:// or https://")
+
+            if max_size is not None:
+                size_value = entry.get("size")
+                try:
+                    if size_value is not None and int(size_value) > max_size:
+                        raise ValidationError(field_id, f"File exceeds maximum size of {max_size} bytes")
+                except (TypeError, ValueError):
+                    # If size is not numeric, skip enforcement
+                    pass
+
+            if accept_rules:
+                if not _file_matches_accept_rules(parsed, entry, accept_rules):
+                    raise ValidationError(field_id, f"File type not permitted. Allowed: {', '.join(accept_rules)}")
+    else:
+        # For string formats, we can only enforce content presence; size/type cannot be reliably checked
+        if max_size is not None:
+            for entry in file_entries:
+                try:
+                    if len(entry["value"]) > max_size:
+                        raise ValidationError(field_id, f"File content exceeds maximum size of {max_size} characters")
+                except TypeError:
+                    pass
+
+
+def _file_matches_accept_rules(
+    parsed_url,
+    entry: Dict[str, Any],
+    accept_rules: List[str]
+) -> bool:
+    """Check if file entry matches accept rules."""
+    path = parsed_url.path or ""
+    extension = ""
+    if "." in path:
+        extension = path[path.rfind("."):].lower()
+
+    mime_type = entry.get("type")
+    if not mime_type:
+        mime_type, _ = mimetypes.guess_type(path)
+    if mime_type:
+        mime_type = mime_type.lower()
+
+    for rule in accept_rules:
+        if rule in ("*/*", "*"):
+            return True
+        if rule.endswith("/*"):
+            base = rule[:-2]
+            if mime_type and mime_type.startswith(base):
+                return True
+        elif rule.startswith("."):
+            if extension == rule:
+                return True
+        else:
+            if mime_type == rule:
+                return True
+
+    return False

@@ -6,6 +6,7 @@ import psycopg2
 from datetime import datetime
 from dotenv import load_dotenv
 import asyncio
+from typing import Optional, Tuple
 from cron_logger import CronExecutionLogger
 
 # Load environment variables
@@ -29,8 +30,8 @@ def get_db_connection():
     """Create and return a database connection."""
     return psycopg2.connect(**DB_CONFIG)
 
-def authenticate_and_get_api_key():
-    """Authenticate with Kodosumi server and retrieve API key."""
+def authenticate_and_get_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """Authenticate with Kodosumi server and retrieve API key plus session cookie."""
     try:
         print(f"Authenticating with Kodosumi server at {KODOSUMI_SERVER_URL}")
         
@@ -46,31 +47,36 @@ def authenticate_and_get_api_key():
         
         if response.status_code == 200:
             api_key = response.json().get("KODOSUMI_API_KEY")
+            session_cookie = response.cookies.get("kodosumi_jwt")
+
             if api_key:
-                print("Successfully authenticated and retrieved API key")
-                return api_key
+                if session_cookie:
+                    print("Successfully authenticated and retrieved API key and session cookie")
+                else:
+                    print("Successfully authenticated and retrieved API key (no session cookie found)")
+                return api_key, session_cookie
             else:
                 print("No API key found in response")
-                return None
+                return None, None
         else:
             print(f"Authentication failed with status code: {response.status_code}")
             print(f"Response: {response.text}")
-            return None
+            return None, None
             
     except Exception as e:
         print(f"Error during authentication: {str(e)}")
-        return None
+        return None, None
 
-def store_api_key(api_key):
-    """Store the API key in the database."""
+def store_api_key(api_key: str, session_cookie: Optional[str]):
+    """Store the API key and optional session cookie in the database."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
         # Insert the new API key
         cursor.execute(
-            "INSERT INTO api_keys (api_key) VALUES (%s)",
-            (api_key,)
+            "INSERT INTO api_keys (api_key, session_cookie) VALUES (%s, %s)",
+            (api_key, session_cookie)
         )
         
         conn.commit()
@@ -96,11 +102,11 @@ async def refresh_api_key_with_logging():
     try:
         print(f"\n--- Starting API key refresh at {datetime.now()} ---")
         
-        api_key = authenticate_and_get_api_key()
+        api_key, session_cookie = authenticate_and_get_credentials()
         
         if api_key:
-            store_api_key(api_key)
-            items_processed = 1  # Successfully stored 1 API key
+            store_api_key(api_key, session_cookie)
+            items_processed = 1  # Successfully stored API credentials
         else:
             error = "Failed to retrieve API key"
             print(error)

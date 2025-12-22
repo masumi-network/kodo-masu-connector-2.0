@@ -15,14 +15,14 @@ The table below reflects the flows currently synced into the connector (last ref
 
 | Flow | UID | Kodosumi Path | URL Identifier |
 |------|-----|---------------|----------------|
-| AI Movie Production Agent | fe4320953f14fae3d14440d1dbd145fa | `/-/0.0.0.0/8000/movie-production-agent/-/` | *(none)* |
-| AttentionInsight Analysis Agent | bb2a50b07e301c7b11f5ca7d98e43041 | `/-/0.0.0.0/8000/attention-insights-agent/-/` | *(none)* |
-| DeepSeek Research Agent | 79bf8b6d5ead8cb324ba510dcd50da02 | `/-/0.0.0.0/8000/deepseek-research-agent/-/` | *(none)* |
-| LLMs.txt Generator Agent | b83b6c72c0c77f4519ad50ff1263bad4 | `/-/0.0.0.0/8000/llm-txt-agent/-/` | *(none)* |
-| Media Trend Analysis Agent | ff875ccbd83c527c20838f78173c17c7 | `/-/0.0.0.0/8000/media-trend-agent/-/` | *(none)* |
-| Meme Creator Agent | 6164617dc39ff681cf32031aa4354c47 | `/-/0.0.0.0/8000/meme-creator/-/` | *(none)* |
-| SEO Analysis Agent | a3e28d905e25f0c2a462b72c79dfa56f | `/-/0.0.0.0/8000/seo-agent/-/` | *(none)* |
-| Veo3 Video Generator | 81519db9ef3244dfd46e1a926fad1ddc | `/-/0.0.0.0/8000/veo3-video-generator/-/` | *(none)* |
-| X (Twitter) User Analyzer | 618ff4bf9300e02107d3b4ac0cade7db | `/-/0.0.0.0/8000/x_analyzer/-/` | *(none)* |
+| AI Movie Production Agent | fe4320953f14fae3d14440d1dbd145fa | `/-/209.38.214.138/8000/movie-production-agent/-/` | *(none)* |
+| AttentionInsight Analysis Agent | bb2a50b07e301c7b11f5ca7d98e43041 | `/-/209.38.214.138/8000/attention-insights-agent/-/` | *(none)* |
+| DeepSeek Research Agent | 79bf8b6d5ead8cb324ba510dcd50da02 | `/-/209.38.214.138/8000/deepseek-research-agent/-/` | *(none)* |
+| LLMs.txt Generator Agent | b83b6c72c0c77f4519ad50ff1263bad4 | `/-/209.38.214.138/8000/llm-txt-agent/-/` | *(none)* |
+| Media Trend Analysis Agent | ff875ccbd83c527c20838f78173c17c7 | `/-/209.38.214.138/8000/media-trend-agent/-/` | *(none)* |
+| Meme Creator Agent | 6164617dc39ff681cf32031aa4354c47 | `/-/209.38.214.138/8000/meme-creator/-/` | *(none)* |
+| SEO Analysis Agent | a3e28d905e25f0c2a462b72c79dfa56f | `/-/209.38.214.138/8000/seo-agent/-/` | *(none)* |
+| Veo3 Video Generator | 81519db9ef3244dfd46e1a926fad1ddc | `/-/209.38.214.138/8000/veo3-video-generator/-/` | *(none)* |
+| X (Twitter) User Analyzer | 618ff4bf9300e02107d3b4ac0cade7db | `/-/209.38.214.138/8000/x_analyzer/-/` | *(none)* |
 
-> **Note**: Replace the `0.0.0.0` host with the actual Kodosumi host (e.g. `138.68.64.204`) when calling these endpoints manually or from the job starter. If the upstream catalog is updated with correct hosts, the next flow sync run will reflect the changes here.
+> **Note**: Replace the `0.0.0.0` host with the actual Kodosumi host (e.g. `209.38.214.138`) when calling these endpoints manually or from the job starter. If the upstream catalog is updated with correct hosts, the next flow sync run will reflect the changes here.

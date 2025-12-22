@@ -7,7 +7,17 @@ The conversion is designed to be easily extensible for future enhancements.
 """
 
 import json
+import re
 from typing import Dict, List, Any, Optional
+
+DEFAULT_FILE_MAX_SIZE = 4_718_592  # 4.5 MB default limit for file uploads
+DEFAULT_ACCEPT_EXTS = [".pdf", ".png", ".jpg", ".jpeg"]
+IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "svg"}
+VIDEO_EXTS = {"mp4", "mov", "avi", "mkv", "webm"}
+AUDIO_EXTS = {"mp3", "wav", "aac", "flac", "ogg"}
+DOCUMENT_EXTS = {"pdf", "doc", "docx", "txt", "rtf", "ppt", "pptx", "xls", "xlsx", "csv"}
+ARCHIVE_EXTS = {"zip", "rar", "7z", "tar", "gz"}
+KNOWN_ACCEPT_EXTS = IMAGE_EXTS | VIDEO_EXTS | AUDIO_EXTS | DOCUMENT_EXTS | ARCHIVE_EXTS
 
 class MIP003Converter:
     """
@@ -131,8 +141,8 @@ class MIP003Converter:
 
         # Handle file inputs
         elif element.get('type') == 'file':
-            # MIP003 expects only an outputFormat hint for file inputs
-            data['outputFormat'] = element.get('outputFormat', 'url')
+            # Use string output format by default unless explicitly provided
+            data['outputFormat'] = element.get('outputFormat', 'string')
     
     def _add_validations(self, element: Dict[str, Any], mip003_element: Dict[str, Any]):
         """
@@ -149,7 +159,7 @@ class MIP003Converter:
         # MIP003 spec: all fields are required by default
         # Only add optional validation if field is NOT required
         # EXCEPTION: Select fields are always required (override Kodosumi setting)
-        if not element.get('required', False) and element_type != 'select':
+        if not element.get('required', False) and element_type not in ['select', 'file']:
             validations.append({
                 'validation': 'optional',
                 'value': 'true'
@@ -171,6 +181,8 @@ class MIP003Converter:
         # Select validations
         elif element_type == 'select':
             self._add_select_validations(element, validations)
+        elif element_type == 'file':
+            self._add_file_validations(element, validations)
         
         # Only add validations field if there are actual validations
         if validations:
@@ -275,6 +287,164 @@ class MIP003Converter:
             'validation': 'max',
             'value': '1'
         })
+
+    def _add_file_validations(self, element: Dict[str, Any], validations: List[Dict[str, Any]]):
+        """Add file-specific validations."""
+        # Determine allowed file counts
+        min_files = self._safe_int(
+            element.get('min_files')
+            or element.get('minFiles')
+            or element.get('min_count')
+            or element.get('minCount')
+        )
+        max_files = self._safe_int(
+            element.get('max_files')
+            or element.get('maxFiles')
+            or element.get('max_count')
+            or element.get('maxCount')
+        )
+        allows_multiple = element.get('multiple', False)
+        is_required = element.get('required', False)
+
+        if min_files is None:
+            min_files = 1
+        else:
+            min_files = max(1, min_files)
+        if max_files is None:
+            max_files = max(min_files, 1) if allows_multiple else max(1, min_files or 0)
+        if max_files < min_files:
+            max_files = min_files
+
+        validations.append({
+            'validation': 'min',
+            'value': str(min_files)
+        })
+        validations.append({
+            'validation': 'max',
+            'value': str(max_files)
+        })
+
+        # Add max size constraint (hard-coded default)
+        validations.append({
+            'validation': 'maxSize',
+            'value': str(DEFAULT_FILE_MAX_SIZE)
+        })
+
+        # Add accepted file types if available
+        accept_value = self._extract_file_accepts(element)
+        validations.append({
+            'validation': 'accept',
+            'value': accept_value
+        })
+
+    def _extract_file_accepts(self, element: Dict[str, Any]) -> str:
+        """Extract accepted file types from the Kodosumi element."""
+        possible_keys = [
+            'accept',
+            'accepts',
+            'accepted_types',
+            'acceptedTypes',
+            'allowed_file_types',
+            'allowedFileTypes',
+            'file_types',
+            'fileTypes',
+            'mime_types',
+            'mimeTypes'
+        ]
+
+        values: List[str] = []
+        for key in possible_keys:
+            raw_value = element.get(key)
+            if raw_value:
+                if isinstance(raw_value, list):
+                    values = [str(item).strip() for item in raw_value if str(item).strip()]
+                elif isinstance(raw_value, str):
+                    values = [part.strip() for part in raw_value.split(',') if part.strip()]
+                else:
+                    values = [str(raw_value).strip()]
+                break
+
+        if not values:
+            inferred = self._infer_accept_from_text(element)
+            if inferred:
+                values = inferred
+
+        if not values:
+            values = DEFAULT_ACCEPT_EXTS.copy()
+
+        normalised_values = self._normalise_accept_values(values)
+
+        # Preserve order while removing duplicates
+        seen: Dict[str, None] = {}
+        for item in normalised_values:
+            if item not in seen:
+                seen[item] = None
+
+        return ",".join(seen.keys())
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        """Convert value to int when possible."""
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _infer_accept_from_text(self, element: Dict[str, Any]) -> List[str]:
+        """Infer file accept values from descriptive text."""
+        text_sources = []
+        for key in ('label', 'description', 'placeholder', 'helperText'):
+            raw_text = element.get(key)
+            if isinstance(raw_text, str):
+                text_sources.append(raw_text)
+
+        combined_text = " ".join(text_sources)
+        if not combined_text:
+            return []
+
+        tokens = set()
+        # Look for tokens inside parentheses first
+        for group in re.findall(r'\(([^)]+)\)', combined_text):
+            tokens.update(self._tokenize_accept_tokens(group))
+
+        # Fallback to scanning the whole text for known tokens
+        if not tokens:
+            tokens.update(self._tokenize_accept_tokens(combined_text))
+
+        if not tokens:
+            return []
+
+        # Return explicit extensions in dotted format
+        return [f".{token}" for token in sorted(tokens) if token]
+
+    def _tokenize_accept_tokens(self, raw_value: str) -> set:
+        """Split raw text into known file tokens."""
+        tokens = set()
+        for part in re.split(r'[,\s/]+', raw_value):
+            sanitized = part.strip().lower().lstrip('.')
+            if sanitized in KNOWN_ACCEPT_EXTS:
+                tokens.add(sanitized)
+        return tokens
+
+    def _normalise_accept_values(self, values: List[str]) -> List[str]:
+        """Ensure accept values follow extension or wildcard formats."""
+        normalised = []
+        for value in values:
+            if not value:
+                continue
+            val = value.strip().lower()
+            if not val:
+                continue
+            if val in ("*/*", "*") or val.endswith("/*"):
+                normalised.append(val)
+            elif val.startswith("."):
+                normalised.append(val)
+            else:
+                # treat as extension without dot
+                normalised.append(f".{val}")
+        return normalised
 
 
 def convert_kodosumi_to_mip003(kodosumi_schema: Dict[str, Any]) -> List[Dict[str, Any]]:

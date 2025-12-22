@@ -7,8 +7,9 @@ import httpx
 import psycopg2
 from datetime import datetime
 from dotenv import load_dotenv
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import asyncio
+from urllib.parse import urlparse
 from cron_logger import CronExecutionLogger
 
 # Ensure shared utilities are importable
@@ -29,6 +30,26 @@ load_dotenv()
 
 # Configuration
 KODOSUMI_SERVER_URL = os.getenv('KODOSUMI_SERVER_URL')
+MIP003_API_BASE_URL = os.getenv('MIP003_API_BASE_URL')
+
+# Pre-compute the public host/port we should publish in flow URLs
+PUBLIC_API_HOST = None
+PUBLIC_API_PORT = None
+
+if MIP003_API_BASE_URL:
+    try:
+        parsed = urlparse(MIP003_API_BASE_URL)
+        PUBLIC_API_HOST = parsed.hostname
+        if parsed.port:
+            PUBLIC_API_PORT = parsed.port
+        elif parsed.scheme == 'https':
+            PUBLIC_API_PORT = 443
+        else:
+            PUBLIC_API_PORT = 80
+    except Exception as exc:
+        print(f"⚠ Failed to parse MIP003_API_BASE_URL='{MIP003_API_BASE_URL}': {exc}")
+        PUBLIC_API_HOST = None
+        PUBLIC_API_PORT = None
 
 # Database configuration
 DB_CONFIG = {
@@ -43,14 +64,20 @@ def get_db_connection():
     """Create and return a database connection."""
     return psycopg2.connect(**DB_CONFIG)
 
-def get_latest_api_key() -> Optional[str]:
-    """Get the latest API key from the database."""
+def _build_cookie_jar(session_cookie: Optional[str]) -> Optional[Dict[str, str]]:
+    """Return a cookie jar dict when a session cookie is available."""
+    if session_cookie:
+        return {"kodosumi_jwt": session_cookie}
+    return None
+
+def get_latest_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """Get the latest API key and session cookie from the database."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT api_key FROM api_keys 
+            SELECT api_key, session_cookie FROM api_keys 
             ORDER BY created_at DESC 
             LIMIT 1
         """)
@@ -60,17 +87,23 @@ def get_latest_api_key() -> Optional[str]:
         conn.close()
         
         if result:
-            print(f"Retrieved API key (first 10 chars): {result[0][:10]}...")
-            return result[0]
+            api_key = result[0]
+            session_cookie = result[1] if len(result) > 1 else None
+            print(f"Retrieved API key (first 10 chars): {api_key[:10]}...")
+            if session_cookie:
+                print("Session cookie is available for authenticated requests")
+            else:
+                print("No session cookie found for authenticated requests")
+            return api_key, session_cookie
         else:
             print("No API key found in database")
-            return None
+            return None, None
             
     except Exception as e:
         print(f"Error retrieving API key: {str(e)}")
-        return None
+        return None, None
 
-def fetch_flows(api_key: str) -> Optional[List[Dict]]:
+def fetch_flows(api_key: str, session_cookie: Optional[str]) -> Optional[List[Dict]]:
     """Fetch all flows from Kodosumi API with pagination."""
     try:
         all_flows = []
@@ -89,6 +122,7 @@ def fetch_flows(api_key: str) -> Optional[List[Dict]]:
                 url,
                 headers={"KODOSUMI_API_KEY": api_key},
                 params=params,
+                cookies=_build_cookie_jar(session_cookie),
                 timeout=30.0
             )
             
@@ -115,7 +149,7 @@ def fetch_flows(api_key: str) -> Optional[List[Dict]]:
         print(f"Error fetching flows: {str(e)}")
         return None
 
-def fetch_flow_input_schema(api_key: str, flow_url: str) -> Optional[Dict]:
+def fetch_flow_input_schema(api_key: str, flow_url: str, session_cookie: Optional[str]) -> Optional[Dict]:
     """Fetch input schema for a specific flow."""
     try:
         # Build the full URL for the flow schema
@@ -126,6 +160,7 @@ def fetch_flow_input_schema(api_key: str, flow_url: str) -> Optional[Dict]:
         response = httpx.get(
             schema_url,
             headers={"KODOSUMI_API_KEY": api_key},
+            cookies=_build_cookie_jar(session_cookie),
             timeout=30.0
         )
         
@@ -143,18 +178,41 @@ def fetch_flow_input_schema(api_key: str, flow_url: str) -> Optional[Dict]:
         return None
 
 def normalize_url(url: str) -> str:
-    """Normalize specific flow URLs for consistency."""
+    """Normalize flow URLs to use the public host and known path conventions."""
     if not url:
         return url
-    
-    # Only normalize the X (Twitter) Analyzer flow URL
-    if 'x-analyzer' in url:
-        normalized_url = url.replace('x-analyzer', 'x_analyzer')
-        print(f"   ℹ Normalized URL: {url} -> {normalized_url}")
-        return normalized_url
-    
-    # Return all other URLs unchanged
-    return url
+
+    normalized = url
+
+    # Normalize known path variations
+    if 'x-analyzer' in normalized:
+        updated = normalized.replace('x-analyzer', 'x_analyzer')
+        if updated != normalized:
+            print(f"   ℹ Normalized URL path: {normalized} -> {updated}")
+            normalized = updated
+
+    if PUBLIC_API_HOST:
+        try:
+            parsed_url = urlparse(normalized)
+            if parsed_url.scheme and parsed_url.netloc:
+                host = PUBLIC_API_HOST
+                port = PUBLIC_API_PORT
+                if port and port not in {80, 443}:
+                    netloc = f"{host}:{port}"
+                elif port == 443 and parsed_url.scheme == 'https':
+                    netloc = host
+                elif port == 80 and parsed_url.scheme == 'http':
+                    netloc = host
+                else:
+                    netloc = host if port is None else f"{host}:{port}"
+                rebuilt = parsed_url._replace(netloc=netloc).geturl()
+                if rebuilt != normalized:
+                    print(f"   ℹ Normalized URL host: {normalized} -> {rebuilt}")
+                    normalized = rebuilt
+        except Exception as exc:
+            print(f"⚠ Failed to normalize host for URL '{normalized}': {exc}")
+
+    return normalized
 
 def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
     """Insert or update a flow in the database with MIP003 conversion."""
@@ -241,13 +299,13 @@ async def sync_flows_with_logging():
         print(f"\n--- Starting flow sync at {datetime.now()} ---")
         
         # Get the latest API key
-        api_key = get_latest_api_key()
+        api_key, session_cookie = get_latest_credentials()
         if not api_key:
             print("No API key available. Skipping flow sync.")
             return False
         
         # Fetch all flows
-        flows = fetch_flows(api_key)
+        flows = fetch_flows(api_key, session_cookie)
         if not flows:
             print("No flows retrieved. Skipping sync.")
             return False
@@ -266,7 +324,7 @@ async def sync_flows_with_logging():
             # Fetch input schema for this flow
             input_schema = None
             if flow_url:
-                input_schema = fetch_flow_input_schema(api_key, flow_url)
+                input_schema = fetch_flow_input_schema(api_key, flow_url, session_cookie)
             
             # Upsert the flow to database
             if upsert_flow(flow, input_schema):
