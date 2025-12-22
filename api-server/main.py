@@ -696,12 +696,13 @@ async def check_job_status(
             # Debug logging
             logger.info(f"Status mapping: db_status={db_status}, api_status={api_status}")
 
-            display_message = user_friendly_message if user_friendly_message is not None else job.get("message")
+            # Determine primary status text
+            primary_text = user_friendly_message if user_friendly_message is not None else job.get("message")
             if api_status == "awaiting_payment":
-                display_message = AWAITING_PAYMENT_MESSAGE
+                primary_text = AWAITING_PAYMENT_MESSAGE
             elif api_status == "running":
-                display_message = RUNNING_MESSAGE
-            
+                primary_text = RUNNING_MESSAGE
+
             final_output_text: Optional[str] = None
             if db_status == "completed":
                 raw_result = job.get("result")
@@ -725,20 +726,21 @@ async def check_job_status(
                     final_output_text = failure_detail
 
             combined_parts: List[str] = []
-            for part in (display_message, final_output_text):
+            for part in (primary_text, final_output_text):
                 if isinstance(part, str):
                     candidate = part.strip()
                     if candidate and candidate not in combined_parts:
                         combined_parts.append(candidate)
-            combined_message = "\n\n".join(combined_parts) if combined_parts else None
+            combined_result = "\n\n".join(combined_parts) if combined_parts else None
+            if not combined_result:
+                combined_result = api_status.capitalize()
             
             try:
                 response = StatusResponse(
                     status_id=status_identifier,
                     job_id=job_id,
                     status=api_status,  # This should work with string value
-                    message=combined_message,
-                    result=combined_message,
+                    result=combined_result,
                     reasoning=job.get("reasoning") if db_status == "completed" else None
                 )
             except Exception as e:
