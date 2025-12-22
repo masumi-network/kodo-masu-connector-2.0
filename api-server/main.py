@@ -681,7 +681,7 @@ async def check_job_status(
                 job_id=job_id,
                 status="failed",  # Return "failed" per MIP003 spec
                 message=failure_message,
-                result=None,
+                result=failure_message,
                 reasoning=None
             )
         else:
@@ -702,37 +702,43 @@ async def check_job_status(
             elif api_status == "running":
                 display_message = RUNNING_MESSAGE
             
-            # Only include result if job is completed
-            result = None
+            final_output_text: Optional[str] = None
             if db_status == "completed":
-                result = job.get("result")
-                if result and isinstance(result, dict):
-                    # Check if this is a kodosumi result with final_result structure
-                    if "final_result" in result and isinstance(result["final_result"], dict):
-                        # Extract the body content from nested structure
-                        final_result = result["final_result"]
-                        if "Markdown" in final_result and isinstance(final_result["Markdown"], dict):
-                            # Return just the body content
-                            result = final_result["Markdown"].get("body", "")
-                        else:
-                            # If not in expected format, return the whole final_result as JSON
-                            import json
-                            result = json.dumps(final_result)
+                raw_result = job.get("result")
+                if isinstance(raw_result, dict):
+                    final_section = raw_result.get("final_result")
+                    if isinstance(final_section, dict):
+                        markdown_block = final_section.get("Markdown")
+                        if isinstance(markdown_block, dict):
+                            final_output_text = markdown_block.get("body")
+                        if not final_output_text:
+                            final_output_text = json.dumps(final_section)
                     else:
-                        # For other dict results, convert to JSON string
-                        import json
-                        result = json.dumps(result)
-            elif job.get("message") and api_status == "failed":
-                # Surface failure details in the result field so clients can display them
-                result = job.get("message")
+                        final_output_text = json.dumps(raw_result)
+                elif isinstance(raw_result, (list, tuple)):
+                    final_output_text = json.dumps(raw_result)
+                elif raw_result is not None:
+                    final_output_text = str(raw_result)
+            elif api_status == "failed":
+                failure_detail = job.get("message")
+                if failure_detail:
+                    final_output_text = failure_detail
+
+            combined_parts: List[str] = []
+            for part in (display_message, final_output_text):
+                if isinstance(part, str):
+                    candidate = part.strip()
+                    if candidate and candidate not in combined_parts:
+                        combined_parts.append(candidate)
+            combined_message = "\n\n".join(combined_parts) if combined_parts else None
             
             try:
                 response = StatusResponse(
                     status_id=status_identifier,
                     job_id=job_id,
                     status=api_status,  # This should work with string value
-                    message=display_message,
-                    result=result,  # Will be None unless job is completed
+                    message=combined_message,
+                    result=combined_message,
                     reasoning=job.get("reasoning") if db_status == "completed" else None
                 )
             except Exception as e:
