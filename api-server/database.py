@@ -207,7 +207,7 @@ class DatabaseManager:
                             WHEN $6 THEN NULL
                             ELSE awaiting_input_status_id
                         END,
-                        current_status_id = COALESCE($8::uuid, gen_random_uuid()),
+                        current_status_id = COALESCE($8::uuid, current_status_id),
                         updated_at = CURRENT_TIMESTAMP
                     WHERE job_id = $9
                     """,
@@ -233,7 +233,7 @@ class DatabaseManager:
                             WHEN $5 THEN NULL
                             ELSE awaiting_input_status_id
                         END,
-                        current_status_id = COALESCE($6::uuid, gen_random_uuid()),
+                        current_status_id = COALESCE($6::uuid, current_status_id),
                         waiting_for_start_in_kodosumi = COALESCE($7, waiting_for_start_in_kodosumi),
                         updated_at = CURRENT_TIMESTAMP
                     WHERE job_id = $8
