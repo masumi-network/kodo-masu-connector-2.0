@@ -33,6 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+RUNNING_MESSAGE = "The agent is now working on your task. Please check back soon."
+
 class PaymentChecker:
     """Service for checking payment status and updating job statuses."""
     
@@ -239,7 +241,7 @@ class PaymentChecker:
                         str(job['job_id']),
                         'running',
                         waiting_for_start=True,
-                        message=WORKING_STATUS_MESSAGE
+                        message=RUNNING_MESSAGE
                     )
                     
                     if success:

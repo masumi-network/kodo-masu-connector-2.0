@@ -47,6 +47,9 @@ from shared.status_messages import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+AWAITING_PAYMENT_MESSAGE = "The Agent is now waiting for its payment and will begin working soon."
+RUNNING_MESSAGE = "The agent is now working on your task. Please check back soon."
+
 def _load_max_start_attempts() -> int:
     value = os.getenv('KODOSUMI_START_MAX_ATTEMPTS', '10')
     try:
@@ -441,14 +444,14 @@ async def start_job(
             await db_manager.update_job_status(
                 job_id=created_job_id,
                 status="awaiting_payment",
-                message=PAYMENT_PENDING_MESSAGE,
+                message=AWAITING_PAYMENT_MESSAGE,
                 waiting_for_start=False
             )
         else:
             await db_manager.update_job_status(
                 job_id=created_job_id,
                 status="running",
-                message="Free job queued for execution",
+                message=RUNNING_MESSAGE,
                 waiting_for_start=True
             )
 
@@ -692,6 +695,12 @@ async def check_job_status(
             
             # Debug logging
             logger.info(f"Status mapping: db_status={db_status}, api_status={api_status}")
+
+            display_message = user_friendly_message if user_friendly_message is not None else job.get("message")
+            if api_status == "awaiting_payment":
+                display_message = AWAITING_PAYMENT_MESSAGE
+            elif api_status == "running":
+                display_message = RUNNING_MESSAGE
             
             # Only include result if job is completed
             result = None
@@ -713,9 +722,7 @@ async def check_job_status(
                         # For other dict results, convert to JSON string
                         import json
                         result = json.dumps(result)
-            elif user_friendly_message is not None:
-                result = user_friendly_message
-            elif job.get("message"):
+            elif job.get("message") and api_status == "failed":
                 # Surface failure details in the result field so clients can display them
                 result = job.get("message")
             
@@ -724,7 +731,7 @@ async def check_job_status(
                     status_id=status_identifier,
                     job_id=job_id,
                     status=api_status,  # This should work with string value
-                    message=user_friendly_message if user_friendly_message is not None else job.get("message"),
+                    message=display_message,
                     result=result,  # Will be None unless job is completed
                     reasoning=job.get("reasoning") if db_status == "completed" else None
                 )
@@ -734,7 +741,7 @@ async def check_job_status(
                 logger.error(f"db_status: {db_status}")
                 raise
         
-        if input_fields:
+        if input_schema_response:
             response.input_schema = input_schema_response
 
         response_payload = response.model_dump(by_alias=True, exclude_none=True)
@@ -851,7 +858,7 @@ async def provide_input(
         await db_manager.update_job_status(
             job_id=input_request.job_id,
             status="running",
-            message=WORKING_STATUS_MESSAGE,
+            message=RUNNING_MESSAGE,
             clear_awaiting_input=True
         )
 

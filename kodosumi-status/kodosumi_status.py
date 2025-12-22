@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 # Payment service is now available through database configuration
 PAYMENT_SERVICE_AVAILABLE = True
 
+RUNNING_MESSAGE = "The agent is now working on your task. Please check back soon."
+
 # Retry configuration
 MAX_TIMEOUT_ATTEMPTS = 20
 MAX_NOT_FOUND_ATTEMPTS = 20
@@ -486,17 +488,68 @@ class KodosumiStatusChecker:
             logger.error(f"Error fetching lock schema for fid={fid}, lid={lid}: {exc}")
         return None
 
+    def extract_awaiting_message(
+        self,
+        status_payload: Dict[str, Any],
+        _depth: int = 0,
+        _max_depth: int = 4
+    ) -> Optional[str]:
+        """Recursively extract a human-facing message from an awaiting status payload."""
+        if not isinstance(status_payload, dict) or _depth > _max_depth:
+            return None
+
+        candidate_keys = [
+            "message",
+            "status_message",
+            "statusMessage",
+            "detail",
+            "details",
+            "prompt",
+            "instructions",
+            "human_message",
+            "humanMessage"
+        ]
+
+        for key in candidate_keys:
+            value = status_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, list):
+                joined = " ".join(str(item).strip() for item in value if isinstance(item, (str, int, float)))
+                if joined.strip():
+                    return joined.strip()
+
+        for key, value in status_payload.items():
+            if isinstance(value, dict):
+                nested = self.extract_awaiting_message(value, _depth + 1, _max_depth)
+                if nested:
+                    return nested
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        nested = self.extract_awaiting_message(item, _depth + 1, _max_depth)
+                        if nested:
+                            return nested
+                    elif isinstance(item, str) and item.strip() and "message" in key.lower():
+                        return item.strip()
+
+        return None
+
     async def mark_job_awaiting_input(
         self,
         conn: asyncpg.Connection,
         job_id: str,
-        locks: List[Dict[str, Any]]
+        locks: List[Dict[str, Any]],
+        message: Optional[str] = None
     ) -> None:
         """Update the job to awaiting_input state and persist lock metadata."""
-        message = "Awaiting human input in Kodosumi"
-        lock_payload = {
+        provided_message = message.strip() if isinstance(message, str) else ""
+        normalized_message = provided_message or "Awaiting human input in Kodosumi"
+        lock_payload: Dict[str, Any] = {
             "locks": locks
         }
+        if normalized_message:
+            lock_payload["message"] = normalized_message
         try:
             await conn.execute(
                 """
@@ -508,7 +561,7 @@ class KodosumiStatusChecker:
                 WHERE job_id = $1::uuid
                 """,
                 job_id,
-                message,
+                normalized_message or None,
                 json.dumps({"kodosumi_locks": lock_payload})
             )
             logger.info(f"Marked job {job_id} as awaiting_input")
@@ -522,6 +575,9 @@ class KodosumiStatusChecker:
         message: Optional[str] = None
     ) -> None:
         """Reset job status to running and clear stored lock metadata."""
+        normalized_message = (
+            message.strip() if isinstance(message, str) and message.strip() else RUNNING_MESSAGE
+        )
         try:
             await conn.execute(
                 """
@@ -536,7 +592,7 @@ class KodosumiStatusChecker:
                 WHERE job_id = $1::uuid
                 """,
                 job_id,
-                message
+                normalized_message
             )
             logger.info(f"Cleared lock state for job {job_id}")
         except Exception as exc:
@@ -903,7 +959,10 @@ class KodosumiStatusChecker:
                                 lock_entry["schema"] = schema
                             lock_entries.append(lock_entry)
 
-                        await self.mark_job_awaiting_input(conn, job_id, lock_entries)
+                        human_message = self.extract_awaiting_message(status_result)
+                        if human_message:
+                            logger.info(f"Job {job_id} awaiting input message: {human_message}")
+                        await self.mark_job_awaiting_input(conn, job_id, lock_entries, human_message)
                         jobs_processed += 1
                     elif status == 'failed' or status == 'error':
                         # Job failed in Kodosumi
@@ -916,7 +975,7 @@ class KodosumiStatusChecker:
                         )
                     elif status == 'running':
                         if job['status'] == 'awaiting_input':
-                            await self.clear_job_lock_state(conn, job_id, "Processing job in Kodosumi")
+                            await self.clear_job_lock_state(conn, job_id)
                         logger.info(f"Job {job_id} is still running in Kodosumi")
                         if await self.update_running_job_progress(conn, job, kodosumi_api_key):
                             jobs_processed += 1
