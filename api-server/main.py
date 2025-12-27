@@ -164,6 +164,96 @@ def _extract_pending_input_context(pending_request: Optional[Dict[str, Any]]) ->
     return None
 
 
+def _extract_pending_input_context_from_result(result_payload: Any) -> Optional[str]:
+    if not result_payload:
+        return None
+
+    data = result_payload
+    if isinstance(data, str):
+        text = data.strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except (ValueError, json.JSONDecodeError):
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    lock_section = data.get("kodosumi_locks")
+    if isinstance(lock_section, dict):
+        locks = lock_section.get("locks")
+        if isinstance(locks, list):
+            for lock in locks:
+                if not isinstance(lock, dict):
+                    continue
+                schema = lock.get("schema")
+                if not schema:
+                    continue
+                context = _extract_pending_input_context({"schema_raw": schema})
+                if context:
+                    return context
+        message = lock_section.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+    message = data.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+
+    return None
+
+
+def _extract_lock_metadata_from_job(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return lock metadata (fid, lock identifier, schema) from a job's result payload."""
+    result_payload = job.get("result")
+    if not result_payload:
+        return None
+
+    data = result_payload
+    if isinstance(data, str):
+        text = data.strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except (ValueError, json.JSONDecodeError):
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    fid = data.get("kodosumi_fid")
+    lock_container = data.get("kodosumi_locks")
+    locks: Optional[List[Any]] = None
+
+    if isinstance(lock_container, dict):
+        locks = lock_container.get("locks")
+    elif isinstance(lock_container, list):
+        locks = lock_container
+
+    if not fid or not isinstance(locks, list):
+        return None
+
+    for lock in locks:
+        if not isinstance(lock, dict):
+            continue
+        lock_id = lock.get("lock_id")
+        if not lock_id:
+            continue
+        schema = lock.get("schema")
+        normalized_schema = schema if isinstance(schema, list) else None
+        return {
+            "kodosumi_fid": fid,
+            "lock_identifier": lock_id,
+            "schema_raw": normalized_schema,
+            "message": lock_container.get("message") if isinstance(lock_container, dict) else None,
+        }
+
+    return None
+
+
 def _extract_final_output_text(payload: Any) -> Optional[str]:
     """Return a human-readable string from nested Kodosumi output structures."""
     if payload in (None, ""):
@@ -223,6 +313,8 @@ def _build_user_friendly_message(job: Dict[str, Any], pending_request: Optional[
 
     if status == "awaiting_input":
         detailed_prompt = _extract_pending_input_context(pending_request)
+        if not detailed_prompt:
+            detailed_prompt = _extract_pending_input_context_from_result(job.get("result"))
         return detailed_prompt or AWAITING_INPUT_MESSAGE
 
     if status == "error":
@@ -644,6 +736,9 @@ async def check_job_status(
         if job["status"] == "awaiting_input":
             pending_request = await db_manager.get_pending_input_request(job_id_str)
             if pending_request:
+                pending_status_id = pending_request.get("status_id")
+                if pending_status_id:
+                    status_identifier = pending_status_id
                 schema = pending_request.get("schema_mip003")
                 if not schema and pending_request.get("schema_raw"):
                     try:
@@ -655,7 +750,6 @@ async def check_job_status(
                     try:
                         input_fields = [InputField(**field) for field in schema]
                         input_schema_response = InputSchemaResponse(input_data=input_fields)
-                        status_identifier = pending_request.get("status_id", status_identifier)
                     except Exception as exc:
                         logger.error(f"Unable to build input schema for job {job_id_str}: {exc}")
 
@@ -801,13 +895,50 @@ async def provide_input(
                 detail=f"Job is not awaiting input (current status: {job['status']})"
             )
 
-        if job.get("awaiting_input_status_id") != input_request.status_id:
+        job_id_str = str(job["job_id"])
+        provided_status_id = input_request.status_id.strip()
+        expected_status_uuid = job.get("awaiting_input_status_id") or job.get("current_status_id")
+        expected_status_id = str(expected_status_uuid) if expected_status_uuid else None
+
+        if expected_status_id and expected_status_id != provided_status_id:
             raise HTTPException(
                 status_code=400,
                 detail="Status identifier does not match the current pending input request"
             )
 
-        pending_request = await db_manager.get_input_request_by_status_id(input_request.status_id)
+        resolved_status_id = expected_status_id or provided_status_id
+
+        pending_request = await db_manager.get_input_request_by_status_id(provided_status_id)
+        if not pending_request or pending_request.get("status") != "pending":
+            fallback_metadata = _extract_lock_metadata_from_job(job)
+            if fallback_metadata and resolved_status_id:
+                existing_pending = await db_manager.get_pending_input_request(job_id_str)
+                if existing_pending and existing_pending.get("status") in {"pending", "awaiting"}:
+                    pending_request = existing_pending
+                else:
+                    schema_raw = fallback_metadata.get("schema_raw")
+                    schema_mip003 = None
+                    if schema_raw:
+                        try:
+                            schema_mip003 = convert_kodosumi_to_mip003({"elements": schema_raw})
+                        except Exception as exc:
+                            logger.error(f"Failed to convert lock schema for job {job_id_str}: {exc}")
+                    try:
+                        pending_request = await db_manager.create_input_request(
+                            job_id_str,
+                            fallback_metadata["kodosumi_fid"],
+                            fallback_metadata["lock_identifier"],
+                            schema_raw,
+                            schema_mip003,
+                            status_id=resolved_status_id,
+                        )
+                    except Exception as exc:
+                        logger.error(f"Unable to persist lock metadata for job {job_id_str}: {exc}")
+                        pending_request = await db_manager.get_input_request_by_status_id(resolved_status_id)
+
+                if pending_request:
+                    await db_manager.ensure_job_awaiting_input_status(job_id_str, resolved_status_id)
+
         if not pending_request or pending_request.get("status") != "pending":
             raise HTTPException(
                 status_code=404,
@@ -846,7 +977,7 @@ async def provide_input(
         if response.status_code != 200:
             error_msg = response.text
             await db_manager.update_input_request_status(
-                input_request.status_id,
+                resolved_status_id,
                 new_status="error",
                 error_message=error_msg
             )
@@ -858,7 +989,7 @@ async def provide_input(
             response_payload = {"raw": response.text}
 
         await db_manager.update_input_request_status(
-            input_request.status_id,
+            resolved_status_id,
             new_status="completed",
             response_data=response_payload
         )

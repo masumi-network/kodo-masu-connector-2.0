@@ -461,7 +461,7 @@ class KodosumiStatusChecker:
         fid: str,
         lid: str,
         api_key: str,
-        session_cookie: Optional[str]
+        session_cookie: Optional[str] = None
     ) -> Optional[List[Dict[str, Any]]]:
         """Fetch the lock schema (form elements) for a given lock."""
         url = f"{self.kodosumi_server_url}/lock/{fid}/{lid}"
@@ -540,14 +540,13 @@ class KodosumiStatusChecker:
         conn: asyncpg.Connection,
         job_id: str,
         locks: List[Dict[str, Any]],
-        message: Optional[str] = None
+        message: Optional[str] = None,
+        status_id: Optional[str] = None,
     ) -> None:
         """Update the job to awaiting_input state and persist lock metadata."""
         provided_message = message.strip() if isinstance(message, str) else ""
         normalized_message = provided_message or "Awaiting human input in Kodosumi"
-        lock_payload: Dict[str, Any] = {
-            "locks": locks
-        }
+        lock_payload: Dict[str, Any] = {"locks": locks}
         if normalized_message:
             lock_payload["message"] = normalized_message
         try:
@@ -555,14 +554,17 @@ class KodosumiStatusChecker:
                 """
                 UPDATE jobs
                 SET status = 'awaiting_input',
-                    message = $2,
-                    result = COALESCE(result, '{}'::jsonb) || $3::jsonb,
+                    message = $3,
+                    awaiting_input_status_id = COALESCE($4::uuid, awaiting_input_status_id, current_status_id),
+                    current_status_id = COALESCE($4::uuid, current_status_id),
+                    result = COALESCE(result, '{}'::jsonb) || $2::jsonb,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE job_id = $1::uuid
                 """,
                 job_id,
-                normalized_message or None,
-                json.dumps({"kodosumi_locks": lock_payload})
+                json.dumps({"kodosumi_locks": lock_payload}),
+                normalized_message,
+                status_id,
             )
             logger.info(f"Marked job {job_id} as awaiting_input")
         except Exception as exc:
@@ -666,27 +668,20 @@ class KodosumiStatusChecker:
             json.dumps(mip003_schema),
         )
 
-    async def fetch_lock_schema(self, fid: str, lock_identifier: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
-        """Retrieve the schema for a specific lock."""
-        lock_url = f"{self.kodosumi_server_url}/lock/{fid}/{lock_identifier}"
-        logger.info(f"Fetching lock schema for FID {fid} lock {lock_identifier}")
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                lock_url,
-                headers={'KODOSUMI_API_KEY': api_key, 'Accept': 'application/json'},
-                timeout=30.0,
-            )
-            if response.status_code != 200:
-                logger.error(f"Failed to fetch lock schema ({response.status_code}): {response.text}")
-                return None
-            data = response.json()
-            if isinstance(data, dict) and 'elements' in data:
-                return data['elements']
-            return data if isinstance(data, list) else None
-
-    async def set_job_awaiting_input(self, conn: asyncpg.Connection, job_id: str, status_id: str, lock_identifier: str):
+    async def set_job_awaiting_input(
+        self,
+        conn: asyncpg.Connection,
+        job_id: str,
+        status_id: str,
+        lock_identifier: str,
+        message: Optional[str] = None,
+    ):
         """Mark a job as awaiting human input with a specific status identifier."""
-        message = f"Awaiting human input ({lock_identifier})"
+        normalized_message = (
+            message.strip()
+            if isinstance(message, str) and message.strip()
+            else f"Awaiting human input ({lock_identifier})"
+        )
         await conn.execute(
             """
             UPDATE jobs
@@ -698,7 +693,7 @@ class KodosumiStatusChecker:
             WHERE job_id = $1::uuid
             """,
             job_id,
-            message,
+            normalized_message,
             status_id,
         )
 
@@ -709,23 +704,47 @@ class KodosumiStatusChecker:
         fid: str,
         lock_identifier: str,
         api_key: str,
-    ) -> bool:
+        *,
+        session_cookie: Optional[str] = None,
+        schema: Optional[List[Dict[str, Any]]] = None,
+        message: Optional[str] = None,
+    ) -> Optional[str]:
         """Ensure there is a pending lock request for the given job and lock."""
         job_id = str(job['job_id'])
         existing = await self.get_pending_lock_request(conn, job_id, lock_identifier)
         if existing:
-            await self.set_job_awaiting_input(conn, job_id, str(existing['status_id']), lock_identifier)
-            return True
+            status_id = str(existing['status_id'])
+            await self.set_job_awaiting_input(
+                conn,
+                job_id,
+                status_id,
+                lock_identifier,
+                message=message,
+            )
+            return status_id
 
-        schema = await self.fetch_lock_schema(fid, lock_identifier, api_key)
+        if schema is None:
+            schema = await self.fetch_lock_schema(
+                fid,
+                lock_identifier,
+                api_key,
+                session_cookie,
+            )
         if not schema:
             logger.error(f"Unable to fetch schema for lock {lock_identifier} (FID {fid})")
-            return False
+            return None
 
         request_row = await self.create_lock_request(conn, job_id, fid, lock_identifier, schema)
-        await self.set_job_awaiting_input(conn, job_id, str(request_row['status_id']), lock_identifier)
-        logger.info(f"Created HITL request {request_row['status_id']} for job {job_id}")
-        return True
+        status_id = str(request_row['status_id'])
+        await self.set_job_awaiting_input(
+            conn,
+            job_id,
+            status_id,
+            lock_identifier,
+            message=message,
+        )
+        logger.info(f"Created HITL request {status_id} for job {job_id}")
+        return status_id
     
     async def submit_result_to_masumi(self, job: Dict[str, Any], final_result: str, api_key: str):
         """Submit job result to Masumi for payment completion."""
@@ -902,16 +921,77 @@ class KodosumiStatusChecker:
                     
                     status = status_result.get('status', 'unknown')
                     locks = status_result.get('locks') or []
+                    awaiting_message = self.extract_awaiting_message(status_result)
 
-                    if status in ('awaiting', 'awaiting_input') and locks:
-                        lock_identifier = locks[0]
-                        logger.info(f"Job {job_id} requires human input for lock {lock_identifier}")
-                        if await self.ensure_lock_request(conn, job, fid, lock_identifier, kodosumi_api_key):
+                    if status in ('awaiting', 'awaiting_input'):
+                        if not locks:
+                            logger.info(f"Job {job_id} awaiting input but no lock identifiers provided")
+                            continue
+
+                        existing_lock_info = (
+                            (job.get('result') or {})
+                            .get('kodosumi_locks', {})
+                            .get('locks', [])
+                        )
+                        existing_lock_map = {
+                            lock.get('lock_id'): lock
+                            for lock in existing_lock_info
+                            if isinstance(lock, dict) and lock.get('lock_id')
+                        }
+
+                        lock_entries: List[Dict[str, Any]] = []
+                        primary_status_id: Optional[str] = None
+
+                        for lid in locks:
+                            if not isinstance(lid, str):
+                                logger.warning(f"Lock identifier {lid} is not a string for job {job_id}")
+                                continue
+
+                            existing_entry = existing_lock_map.get(lid) or {}
+                            schema = existing_entry.get('schema')
+
+                            if schema is None:
+                                fetched_schema = await self.fetch_lock_schema(
+                                    fid,
+                                    lid,
+                                    kodosumi_api_key,
+                                    session_cookie,
+                                )
+                                if isinstance(fetched_schema, dict) and 'elements' in fetched_schema:
+                                    schema = fetched_schema.get('elements')
+                                else:
+                                    schema = fetched_schema
+
+                            entry: Dict[str, Any] = {"lock_id": lid}
+                            if schema is not None:
+                                entry["schema"] = schema
+
+                            status_id = await self.ensure_lock_request(
+                                conn,
+                                job,
+                                fid,
+                                lid,
+                                kodosumi_api_key,
+                                session_cookie=session_cookie,
+                                schema=schema if isinstance(schema, list) else None,
+                                message=awaiting_message,
+                            )
+                            if status_id and primary_status_id is None:
+                                primary_status_id = status_id
+
+                            lock_entries.append(entry)
+
+                        if lock_entries:
+                            await self.mark_job_awaiting_input(
+                                conn,
+                                job_id,
+                                lock_entries,
+                                awaiting_message,
+                                primary_status_id,
+                            )
                             jobs_processed += 1
-                        else:
-                            logger.error(f"Failed to prepare human input request for job {job_id}")
                         continue
-                    
+
                     if status == 'finished':
                         # Job is completed, update with final result
                         final_result = status_result.get('final')
@@ -930,40 +1010,6 @@ class KodosumiStatusChecker:
                                 logger.error(f"Failed to update completed job {job_id}")
                         else:
                             logger.warning(f"Job {job_id} marked as finished but no final result provided")
-                    elif status == 'awaiting':
-                        locks = status_result.get('locks') or []
-                        if not locks:
-                            logger.info(f"Job {job_id} awaiting input but no lock IDs provided")
-                            continue
-
-                        existing_lock_info = (
-                            (job.get('result') or {})
-                            .get('kodosumi_locks', {})
-                            .get('locks', [])
-                        )
-                        existing_lock_ids = {
-                            lock.get('lock_id') for lock in existing_lock_info if lock.get('lock_id')
-                        }
-                        lock_ids = set(locks)
-
-                        # Only refresh lock metadata when we don't already have the same set
-                        if job['status'] == 'awaiting_input' and lock_ids.issubset(existing_lock_ids):
-                            logger.info(f"Job {job_id} already awaiting input with stored lock metadata")
-                            continue
-
-                        lock_entries: List[Dict[str, Any]] = []
-                        for lid in locks:
-                            schema = await self.fetch_lock_schema(fid, lid, kodosumi_api_key, session_cookie)
-                            lock_entry: Dict[str, Any] = {"lock_id": lid}
-                            if schema is not None:
-                                lock_entry["schema"] = schema
-                            lock_entries.append(lock_entry)
-
-                        human_message = self.extract_awaiting_message(status_result)
-                        if human_message:
-                            logger.info(f"Job {job_id} awaiting input message: {human_message}")
-                        await self.mark_job_awaiting_input(conn, job_id, lock_entries, human_message)
-                        jobs_processed += 1
                     elif status == 'failed' or status == 'error':
                         # Job failed in Kodosumi
                         logger.warning(f"Job {job_id} failed in Kodosumi with status: {status}")

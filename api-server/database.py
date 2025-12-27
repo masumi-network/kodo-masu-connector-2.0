@@ -1,6 +1,6 @@
 import asyncio
 import asyncpg
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 import json
 import logging
 from config import config
@@ -297,25 +297,61 @@ class DatabaseManager:
         job_id: str,
         kodosumi_fid: str,
         lock_identifier: str,
-        schema_raw: Optional[Dict[str, Any]],
+        schema_raw: Optional[Union[Dict[str, Any], List[Any]]],
         schema_mip003: Optional[List[Dict[str, Any]]],
+        *,
+        status_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a new human-in-the-loop input request."""
         async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
+            if status_id:
+                query = """
+                    INSERT INTO job_input_requests (
+                        status_id, job_id, kodosumi_fid, lock_identifier, schema_raw, schema_mip003
+                    )
+                    VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::jsonb)
+                    RETURNING *
                 """
-                INSERT INTO job_input_requests (
-                    job_id, kodosumi_fid, lock_identifier, schema_raw, schema_mip003
-                ) VALUES ($1, $2, $3, $4, $5)
-                RETURNING *
+                params = (
+                    status_id,
+                    job_id,
+                    kodosumi_fid,
+                    lock_identifier,
+                    json.dumps(schema_raw) if schema_raw is not None else None,
+                    json.dumps(schema_mip003) if schema_mip003 is not None else None,
+                )
+            else:
+                query = """
+                    INSERT INTO job_input_requests (
+                        job_id, kodosumi_fid, lock_identifier, schema_raw, schema_mip003
+                    )
+                    VALUES ($1::uuid, $2, $3, $4::jsonb, $5::jsonb)
+                    RETURNING *
+                """
+                params = (
+                    job_id,
+                    kodosumi_fid,
+                    lock_identifier,
+                    json.dumps(schema_raw) if schema_raw is not None else None,
+                    json.dumps(schema_mip003) if schema_mip003 is not None else None,
+                )
+            row = await conn.fetchrow(query, *params)
+            return self._parse_input_request(row)
+
+    async def ensure_job_awaiting_input_status(self, job_id: str, status_id: str):
+        """Ensure the jobs table tracks the provided awaiting input status identifier."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE jobs
+                SET awaiting_input_status_id = $2::uuid,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = $1::uuid
+                  AND (awaiting_input_status_id IS DISTINCT FROM $2::uuid)
                 """,
                 job_id,
-                kodosumi_fid,
-                lock_identifier,
-                json.dumps(schema_raw) if schema_raw is not None else None,
-                json.dumps(schema_mip003) if schema_mip003 is not None else None,
+                status_id,
             )
-            return self._parse_input_request(row)
 
     async def update_input_request_status(
         self,
@@ -341,6 +377,34 @@ class DatabaseManager:
                 json.dumps(response_data) if response_data is not None else None,
                 error_message,
             )
+
+    async def get_job_status_history(self, job_id: str) -> List[Dict[str, Any]]:
+        """Return chronological history of status identifiers for a job."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT status,
+                       status_id::text AS status_id,
+                       message,
+                       created_at
+                FROM job_status_events
+                WHERE job_id = $1::uuid
+                ORDER BY created_at ASC
+                """,
+                job_id,
+            )
+
+        history: List[Dict[str, Any]] = []
+        for row in rows:
+            history.append(
+                {
+                    "status": row["status"],
+                    "status_id": row["status_id"],
+                    "message": row["message"],
+                    "created_at": row["created_at"],
+                }
+            )
+        return history
 
     def _parse_input_request(self, row: Optional[asyncpg.Record]) -> Optional[Dict[str, Any]]:
         """Convert a raw input request row into a dict with parsed JSON."""
