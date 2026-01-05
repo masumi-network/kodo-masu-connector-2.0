@@ -71,6 +71,8 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    volumes:
+      - ./shared:/app/shared:ro
 
   admin-dashboard:
     build:
@@ -117,6 +119,8 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    volumes:
+      - ./shared:/app/shared:ro
 
   payment-checker:
     build:
@@ -138,6 +142,8 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    volumes:
+      - ./shared:/app/shared:ro
 
   kodosumi-starter:
     build:
@@ -178,6 +184,8 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    volumes:
+      - ./shared:/app/shared:ro
 
 volumes:
   postgres_data:

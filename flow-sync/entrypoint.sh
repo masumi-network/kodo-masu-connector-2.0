@@ -11,5 +11,9 @@ echo "Flow sync will run every 30 minutes"
 echo "Running initial flow sync..."
 python /app/flow_sync.py
 
+# Apply any converter-driven schema migrations
+echo "Running MIP003 schema refresh..."
+python /app/update_mip003_schemas.py || echo "Schema refresh failed; check logs for details."
+
 # Start cron and tail the log
 cron && tail -f /var/log/flow-sync.log

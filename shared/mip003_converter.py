@@ -141,8 +141,22 @@ class MIP003Converter:
 
         # Handle file inputs
         elif element.get('type') == 'file':
-            # Use string output format by default unless explicitly provided
-            data['outputFormat'] = element.get('outputFormat', 'string')
+            # Default to URL output format; allow explicit override if provided
+            data['outputFormat'] = element.get('outputFormat', 'url')
+            # Add friendly size guidance if original schema specifies or falls back to default
+            size_hint = element.get('max_size') or element.get('maxSize') or DEFAULT_FILE_MAX_SIZE
+            description = element.get('description') or data.get('description')
+            if size_hint and not description:
+                try:
+                    size_value = int(size_hint)
+                    size_mb = size_value / (1024 * 1024)
+                    if size_mb.is_integer():
+                        friendly_size = f"{int(size_mb)}MB"
+                    else:
+                        friendly_size = f"{size_mb:.1f}MB".rstrip('0').rstrip('.')
+                    data['description'] = f"Max upload size {friendly_size}"
+                except (TypeError, ValueError):
+                    data['description'] = "Max upload size 4.5MB"
     
     def _add_validations(self, element: Dict[str, Any], mip003_element: Dict[str, Any]):
         """
@@ -322,12 +336,6 @@ class MIP003Converter:
         validations.append({
             'validation': 'max',
             'value': str(max_files)
-        })
-
-        # Add max size constraint (hard-coded default)
-        validations.append({
-            'validation': 'maxSize',
-            'value': str(DEFAULT_FILE_MAX_SIZE)
         })
 
         # Add accepted file types if available
