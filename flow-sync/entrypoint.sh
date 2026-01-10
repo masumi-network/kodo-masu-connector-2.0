@@ -5,7 +5,7 @@ printenv | grep -E '^(POSTGRES_|KODOSUMI_|PAYMENT_)' | sed 's/=\(.*\)/="\1"/' | 
 
 # Start cron in foreground
 echo "Starting Flow Sync cron service..."
-echo "Flow sync will run every 30 minutes"
+echo "Flow sync will run every 5 minutes"
 
 # Run initial sync immediately
 echo "Running initial flow sync..."

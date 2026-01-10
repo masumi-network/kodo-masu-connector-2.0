@@ -128,5 +128,6 @@ class ResponseCache:
 # Global cache instances
 flow_cache = FlowCache(maxsize=100, ttl=300)  # 5 minutes TTL
 response_cache = ResponseCache(maxsize=500, ttl=60)  # 1 minute TTL for most responses
-schema_cache = ResponseCache(maxsize=200, ttl=600)  # 10 minutes TTL for schemas
+# Shorter schema cache so flow changes propagate faster
+schema_cache = ResponseCache(maxsize=200, ttl=120)  # 2 minutes TTL for schemas
 not_found_cache = ResponseCache(maxsize=1000, ttl=300)  # 5 minutes TTL for 404s

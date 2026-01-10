@@ -5,7 +5,7 @@ printenv | grep -E '^(POSTGRES_|KODOSUMI_|PAYMENT_)' | sed 's/=\(.*\)/="\1"/' | 
 
 # Start cron in foreground
 echo "Starting Authenticator cron service..."
-echo "API key sync will run every 10 hours"
+echo "API key sync will run every 10 minutes"
 
 # Run initial authentication immediately
 echo "Running initial API key sync..."

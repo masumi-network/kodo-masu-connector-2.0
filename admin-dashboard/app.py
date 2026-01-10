@@ -345,14 +345,14 @@ def api_cron_status():
             {
                 'name': 'API Key Sync',
                 'service': 'authenticator',
-                'schedule': 'Every 10 hours',
-                'schedule_cron': '0 */10 * * *'
+                'schedule': 'Every 10 minutes',
+                'schedule_cron': '*/10 * * * *'
             },
             {
                 'name': 'Flow Sync', 
                 'service': 'flow-sync',
-                'schedule': 'Every 30 minutes',
-                'schedule_cron': '*/30 * * * *'
+                'schedule': 'Every 5 minutes',
+                'schedule_cron': '*/5 * * * *'
             },
             {
                 'name': 'Payment Checker',
@@ -392,8 +392,8 @@ def api_cron_status():
                 
                 # Expected intervals in seconds
                 expected_intervals = {
-                    'authenticator': 36000,      # 10 hours
-                    'flow-sync': 1800,          # 30 minutes
+                    'authenticator': 600,       # 10 minutes
+                    'flow-sync': 300,          # 5 minutes
                     'payment-checker': 120,     # 2 minutes
                     'kodosumi-starter': 60,     # 1 minute
                     'kodosumi-status': 120      # 2 minutes
@@ -411,16 +411,11 @@ def api_cron_status():
             last_exec = stats.get('last_execution')
             if last_exec:
                 if service_name == 'authenticator':
-                    # Next 10-hour boundary
-                    hour = last_exec.hour
-                    next_hour = ((hour // 10) + 1) * 10
-                    if next_hour >= 24:
-                        next_run = (last_exec.replace(hour=0, minute=0, second=0) + timedelta(days=1))
-                    else:
-                        next_run = last_exec.replace(hour=next_hour, minute=0, second=0)
+                    # Next 10-minute boundary
+                    next_run = last_exec + timedelta(minutes=10)
                 elif service_name == 'flow-sync':
-                    # Next 30-minute boundary
-                    next_run = last_exec + timedelta(minutes=30)
+                    # Next 5-minute boundary
+                    next_run = last_exec + timedelta(minutes=5)
                 elif service_name == 'payment-checker':
                     # Next 2-minute boundary
                     next_run = last_exec + timedelta(minutes=2)

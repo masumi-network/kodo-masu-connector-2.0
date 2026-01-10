@@ -25,8 +25,8 @@ bash deploy-scaled.sh  # Production deployment with load balancer
 |---------|---------|----------|
 | **API Server** | MIP-003 compliant REST API | Always on |
 | **PostgreSQL** | Data persistence | Always on |
-| **Authenticator** | Kodosumi API key management | Every 10 hours |
-| **Flow Sync** | Workflow synchronization | Every 2 hours |
+| **Authenticator** | Kodosumi API key management | Every 10 minutes |
+| **Flow Sync** | Workflow synchronization | Every 5 minutes |
 | **Payment Checker** | Blockchain payment verification | Every 5 minutes |
 | **Kodosumi Starter** | Job submission to Kodosumi | Every 2 minutes |
 | **Kodosumi Status** | Job completion monitoring | Every 2 minutes |

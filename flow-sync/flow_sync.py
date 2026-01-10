@@ -234,7 +234,7 @@ def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
                 print(f"   ⚠ MIP003 conversion failed: {str(e)}")
                 mip003_schema = None
         
-        # Prepare the upsert query - using summary as the key instead of uid
+        # Prepare the upsert query - prefer uid to avoid summary-based conflicts
         upsert_query = """
             INSERT INTO flows (
                 uid, author, deprecated, description, method, 
@@ -242,8 +242,7 @@ def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
-            ON CONFLICT (summary) DO UPDATE SET
-                uid = EXCLUDED.uid,
+            ON CONFLICT ON CONSTRAINT flows_uid_key DO UPDATE SET
                 author = EXCLUDED.author,
                 deprecated = EXCLUDED.deprecated,
                 description = EXCLUDED.description,

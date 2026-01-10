@@ -58,7 +58,7 @@
                 <h6>API Key Sync</h6>
                 <p class="text-muted">Authenticates with the Kodosumi server and refreshes the API key used for all other services.</p>
                 <ul class="list-unstyled">
-                    <li><strong>Frequency:</strong> Every 10 hours</li>
+                    <li><strong>Frequency:</strong> Every 10 minutes</li>
                     <li><strong>Purpose:</strong> Maintain valid authentication</li>
                     <li><strong>Dependencies:</strong> Kodosumi server, Database</li>
                 </ul>
@@ -66,7 +66,7 @@
                 <h6 class="mt-4">Flow Sync</h6>
                 <p class="text-muted">Fetches all available flows from the Kodosumi API and updates the local database with the latest information.</p>
                 <ul class="list-unstyled">
-                    <li><strong>Frequency:</strong> Every 30 minutes</li>
+                    <li><strong>Frequency:</strong> Every 5 minutes</li>
                     <li><strong>Purpose:</strong> Keep flow catalog up-to-date</li>
                     <li><strong>Dependencies:</strong> API key, Kodosumi server, Database</li>
                 </ul>

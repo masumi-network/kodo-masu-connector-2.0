@@ -97,7 +97,7 @@ API Key Sync - Total Executions: 3 (actually total API keys)
 
 You'll see:
 ```
-API Key Sync - Total Executions: 168 (ran every 10 hours for 7 days)
+API Key Sync - Total Executions: 1008 (ran every 10 minutes for 7 days)
   - Successful: 167
   - Failed: 1
   - Items Processed: 3

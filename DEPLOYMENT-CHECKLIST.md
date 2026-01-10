@@ -80,8 +80,8 @@ curl http://localhost:8000/health
 - **Fixed Dependencies**: All services include required Python packages
 
 ### Service Schedule
-- **Authenticator**: Every 10 hours (API key refresh)
-- **Flow Sync**: Every 30 minutes (workflow catalog update)
+- **Authenticator**: Every 10 minutes (API key refresh)
+- **Flow Sync**: Every 5 minutes (workflow catalog update)
 - **Payment Checker**: Every 2 minutes (payment verification)
 - **Kodosumi Starter**: Every minute (job submission)
 - **Kodosumi Status**: Every 2 minutes (job completion check)
