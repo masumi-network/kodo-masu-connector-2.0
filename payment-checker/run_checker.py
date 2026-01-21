@@ -30,23 +30,23 @@ class PaymentCheckerService:
         self.running = False
     
     async def run(self):
-        """Main service loop - run payment checker every minute."""
-        logger.info("Payment Checker Service started - checking every 60 seconds")
-        
+        """Main service loop - run payment checker every 30 seconds."""
+        logger.info("Payment Checker Service started - checking every 30 seconds")
+
         while self.running:
             try:
                 start_time = time.time()
-                
+
                 logger.info("Starting payment check cycle...")
                 await self.checker.process_payments()
-                
+
                 elapsed = time.time() - start_time
                 logger.info(f"Payment check cycle completed in {elapsed:.2f} seconds")
-                
-                # Wait for 120 seconds (2 minutes) before next check
+
+                # Wait for 30 seconds before next check
                 if self.running:
-                    logger.info("Waiting 120 seconds before next check...")
-                    await asyncio.sleep(120)
+                    logger.info("Waiting 30 seconds before next check...")
+                    await asyncio.sleep(30)
                     
             except Exception as e:
                 logger.error(f"Error in payment checker service: {e}")

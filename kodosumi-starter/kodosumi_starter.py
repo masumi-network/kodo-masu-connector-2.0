@@ -15,6 +15,8 @@ import os
 import json
 import math
 import mimetypes
+import re
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -364,6 +366,136 @@ class KodosumiStarter:
             return ""
         return str(value)
 
+    def _convert_date_fields(self, payload: Dict[str, Any], schema: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Convert date/datetime fields from ISO format to Kodosumi-compatible format.
+
+        Kodosumi expects:
+        - date fields: 'YYYY-MM-DD'
+        - datetime fields: 'YYYY-MM-DDTHH:MM' (no seconds, no timezone)
+        - time fields: 'HH:MM'
+
+        API/MIP003 may send:
+        - '2025-12-31T23:00:00.000Z' (ISO with timezone)
+        - '2025-12-31T23:00:00Z'
+        - '2025-12-31T23:00:00'
+        - '2025-12-31'
+        """
+        converted = payload.copy()
+
+        # Build a map of field types from schema
+        field_types = {}
+        for field in schema:
+            field_id = field.get('id')
+            field_type = field.get('type')
+            if field_id and field_type:
+                field_types[field_id] = field_type
+
+        for field_id, value in payload.items():
+            if not isinstance(value, str) or not value:
+                continue
+
+            field_type = field_types.get(field_id)
+
+            # Check if this looks like an ISO date string
+            if not self._looks_like_iso_date(value):
+                continue
+
+            try:
+                if field_type == 'date':
+                    # Convert to YYYY-MM-DD
+                    converted[field_id] = self._parse_iso_to_date(value)
+                    logger.info(f"Converted date field {field_id}: '{value}' -> '{converted[field_id]}'")
+
+                elif field_type == 'datetime':
+                    # Convert to YYYY-MM-DDTHH:MM (no seconds, no timezone)
+                    converted[field_id] = self._parse_iso_to_datetime_local(value)
+                    logger.info(f"Converted datetime field {field_id}: '{value}' -> '{converted[field_id]}'")
+
+                elif field_type == 'time':
+                    # Convert to HH:MM
+                    converted[field_id] = self._parse_iso_to_time(value)
+                    logger.info(f"Converted time field {field_id}: '{value}' -> '{converted[field_id]}'")
+
+                elif field_type is None and self._looks_like_iso_date(value):
+                    # Field type not in schema but value looks like ISO date
+                    # Try to infer and convert
+                    if 'T' in value:
+                        converted[field_id] = self._parse_iso_to_datetime_local(value)
+                        logger.info(f"Converted inferred datetime field {field_id}: '{value}' -> '{converted[field_id]}'")
+                    else:
+                        converted[field_id] = self._parse_iso_to_date(value)
+                        logger.info(f"Converted inferred date field {field_id}: '{value}' -> '{converted[field_id]}'")
+
+            except Exception as e:
+                logger.warning(f"Failed to convert date field {field_id} with value '{value}': {e}")
+
+        return converted
+
+    def _looks_like_iso_date(self, value: str) -> bool:
+        """Check if a string looks like an ISO date/datetime."""
+        # Match patterns like:
+        # 2025-12-31
+        # 2025-12-31T23:00:00
+        # 2025-12-31T23:00:00.000Z
+        # 2025-12-31T23:00:00Z
+        # 2025-12-31T23:00:00+00:00
+        iso_pattern = r'^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:\d{2})?)?$'
+        return bool(re.match(iso_pattern, value))
+
+    def _parse_iso_to_date(self, value: str) -> str:
+        """Parse ISO date string and return YYYY-MM-DD format."""
+        # Handle various ISO formats
+        value = value.replace('Z', '+00:00')
+
+        # Try parsing with fromisoformat
+        try:
+            dt = datetime.fromisoformat(value)
+            return dt.strftime('%Y-%m-%d')
+        except ValueError:
+            pass
+
+        # Fallback: extract just the date part
+        match = re.match(r'^(\d{4}-\d{2}-\d{2})', value)
+        if match:
+            return match.group(1)
+
+        return value
+
+    def _parse_iso_to_datetime_local(self, value: str) -> str:
+        """Parse ISO datetime string and return YYYY-MM-DDTHH:MM format (no seconds, no TZ)."""
+        value = value.replace('Z', '+00:00')
+
+        try:
+            dt = datetime.fromisoformat(value)
+            return dt.strftime('%Y-%m-%dT%H:%M')
+        except ValueError:
+            pass
+
+        # Fallback: extract date and time without seconds
+        match = re.match(r'^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})', value)
+        if match:
+            return f"{match.group(1)}T{match.group(2)}"
+
+        return value
+
+    def _parse_iso_to_time(self, value: str) -> str:
+        """Parse ISO time/datetime string and return HH:MM format."""
+        value = value.replace('Z', '+00:00')
+
+        try:
+            dt = datetime.fromisoformat(value)
+            return dt.strftime('%H:%M')
+        except ValueError:
+            pass
+
+        # Fallback: extract just the time part
+        match = re.search(r'T?(\d{2}:\d{2})', value)
+        if match:
+            return match.group(1)
+
+        return value
+
     async def get_flow_schema(self, conn: asyncpg.Connection, flow_uid: str) -> Optional[List[Dict[str, Any]]]:
         """Get the MIP003 schema for a flow."""
         try:
@@ -453,8 +585,12 @@ class KodosumiStarter:
                 # Log before conversion
                 logger.info(f"Payload before conversion: {payload}")
                 payload = await self.convert_indices_to_values(payload, schema)
-                logger.info(f"Payload after conversion: {payload}")
-                
+                logger.info(f"Payload after indices conversion: {payload}")
+
+                # Convert date/datetime fields from ISO format to Kodosumi format
+                payload = self._convert_date_fields(payload, schema)
+                logger.info(f"Payload after date conversion: {payload}")
+
                 # Add empty strings for missing optional fields to handle Kodosumi's .strip() calls
                 for field in schema:
                     field_id = field.get('id')

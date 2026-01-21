@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 import asyncio
 import asyncpg
+import aiohttp
 import logging
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
-from masumi.payment import Payment
-from masumi.config import Config as MasumiConfig
 
 # Ensure shared modules are importable both locally and in containers
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -35,19 +35,19 @@ logger = logging.getLogger(__name__)
 
 RUNNING_MESSAGE = "The agent is now working on your task. Please check back soon."
 
+# Payment timeout: fail jobs that have been awaiting payment for too long
+PAYMENT_TIMEOUT_HOURS = int(os.getenv('PAYMENT_TIMEOUT_HOURS', '12'))
+
 class PaymentChecker:
     """Service for checking payment status and updating job statuses."""
     
     def __init__(self):
         # Database configuration
         self.database_url = self._build_database_url()
-        
-        # Masumi configuration
-        self.masumi_config = MasumiConfig(
-            payment_service_url=os.getenv('PAYMENT_SERVICE_URL'),
-            payment_api_key=os.getenv('PAYMENT_API_KEY')
-        )
-        
+
+        # Payment service configuration
+        self.payment_service_url = os.getenv('PAYMENT_SERVICE_URL')
+        self.payment_api_key = os.getenv('PAYMENT_API_KEY')
         self.network = os.getenv('NETWORK', 'mainnet')
         
     def _build_database_url(self) -> str:
@@ -96,38 +96,87 @@ class PaymentChecker:
 
         return jobs
     
-    async def get_payment_status_for_job(self, agent_identifier: str, job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Get payment status for a specific job from Masumi service."""
+    async def fetch_recent_payments(self) -> Dict[str, Dict[str, Any]]:
+        """Fetch all recent payments (< PAYMENT_TIMEOUT_HOURS old) using offset-based pagination.
+
+        Returns a dict mapping blockchainIdentifier -> payment data.
+        Stops paginating when payments are older than the timeout threshold.
+        """
+        payments_map: Dict[str, Dict[str, Any]] = {}
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=PAYMENT_TIMEOUT_HOURS)
+
+        url = f"{self.payment_service_url}/payment/"
+        headers = {'token': self.payment_api_key}
+        limit = 100
+        offset = 0
+        total_fetched = 0
+
         try:
-            # Create a Payment instance for this specific job
-            payment = Payment(
-                agent_identifier=agent_identifier,
-                config=self.masumi_config,
-                network=self.network,
-                identifier_from_purchaser=job['identifier_from_purchaser'],
-                input_data=job['input_data']
-            )
-            
-            # Add the specific blockchain identifier for this job
-            blockchain_id = self.extract_blockchain_identifier(job['payment_data'])
-            if blockchain_id:
-                payment.payment_ids.add(blockchain_id)
-                logger.info(f"Added payment ID {blockchain_id[:20]}... for job {job['job_id']}")
-            else:
-                logger.warning(f"Job {job['job_id']} has no blockchain identifier")
-                return None
-            
-            logger.info(f"Checking payment status for job {job['job_id']} with agent {agent_identifier[:20]}...")
-            
-            # Check payment status - use default limit (100 is max allowed)
-            response = await payment.check_payment_status()
-            
-            logger.info(f"Retrieved payment status for job {job['job_id']}")
-            return response
-            
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    params = {
+                        'network': self.network,
+                        'limit': limit,
+                        'offset': offset
+                    }
+
+                    async with session.get(url, headers=headers, params=params, timeout=30) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            logger.error(f"Payment API returned {response.status}: {error_text}")
+                            break
+
+                        result = await response.json()
+                        payments = result.get('data', {}).get('Payments', [])
+
+                        if not payments:
+                            logger.info(f"No more payments at offset {offset}")
+                            break
+
+                        total_fetched += len(payments)
+                        found_old_payment = False
+
+                        for payment in payments:
+                            # Parse createdAt timestamp
+                            created_at_str = payment.get('createdAt')
+                            if created_at_str:
+                                try:
+                                    # Parse ISO format: 2026-01-21T23:17:23.686Z
+                                    created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+
+                                    # Stop if payment is older than cutoff
+                                    if created_at < cutoff_time:
+                                        found_old_payment = True
+                                        continue  # Skip old payments but check rest of page
+                                except (ValueError, TypeError) as e:
+                                    logger.warning(f"Could not parse createdAt '{created_at_str}': {e}")
+
+                            # Add to map
+                            blockchain_id = payment.get('blockchainIdentifier')
+                            if blockchain_id:
+                                payments_map[blockchain_id] = payment
+
+                        # If we found an old payment, we've gone far enough
+                        if found_old_payment:
+                            logger.info(f"Reached payments older than {PAYMENT_TIMEOUT_HOURS}h at offset {offset}")
+                            break
+
+                        # If we got fewer than limit, we've reached the end
+                        if len(payments) < limit:
+                            logger.info(f"Reached end of payments at offset {offset}")
+                            break
+
+                        offset += limit
+
+            logger.info(f"Fetched {total_fetched} payments, {len(payments_map)} are recent (< {PAYMENT_TIMEOUT_HOURS}h old)")
+            return payments_map
+
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error fetching payments: {e}")
+            return payments_map
         except Exception as e:
-            logger.error(f"Failed to get payment status for job {job['job_id']}: {e}")
-            return None
+            logger.error(f"Error fetching payments: {e}")
+            return payments_map
     
     async def update_job_status(
         self,
@@ -161,10 +210,47 @@ class PaymentChecker:
         # Check nested structure first (new format)
         if 'data' in payment_data and isinstance(payment_data['data'], dict):
             return payment_data['data'].get('blockchainIdentifier')
-        
+
         # Fallback to direct access (old format)
         return payment_data.get('blockchainIdentifier')
-    
+
+    async def timeout_old_awaiting_payment_jobs(self, conn: asyncpg.Connection) -> int:
+        """Mark jobs that have been awaiting payment for too long as failed.
+
+        Returns the number of jobs timed out.
+        """
+        # Use naive datetime to match database timestamps (which are stored without timezone)
+        timeout_cutoff = datetime.utcnow() - timedelta(hours=PAYMENT_TIMEOUT_HOURS)
+
+        query = """
+            UPDATE jobs
+            SET status = 'failed',
+                message = $1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'awaiting_payment'
+              AND created_at < $2
+            RETURNING job_id
+        """
+
+        timeout_message = f"Payment not received within {PAYMENT_TIMEOUT_HOURS} hours. Job timed out."
+
+        try:
+            rows = await conn.fetch(query, timeout_message, timeout_cutoff)
+            timed_out_count = len(rows)
+
+            if timed_out_count > 0:
+                logger.info(f"Timed out {timed_out_count} jobs that were awaiting payment for more than {PAYMENT_TIMEOUT_HOURS} hours")
+                for row in rows[:10]:  # Log first 10
+                    logger.info(f"  Timed out job: {row['job_id']}")
+                if timed_out_count > 10:
+                    logger.info(f"  ... and {timed_out_count - 10} more")
+
+            return timed_out_count
+
+        except Exception as e:
+            logger.error(f"Error timing out old jobs: {e}")
+            return 0
+
     async def process_payments(self):
         """Main process to check payments and update job statuses."""
         # Initialize cron logger
@@ -177,65 +263,55 @@ class PaymentChecker:
         try:
             # Connect to database
             conn = await asyncpg.connect(self.database_url)
-            
+
+            # First, timeout any jobs that have been awaiting payment for too long
+            timed_out = await self.timeout_old_awaiting_payment_jobs(conn)
+            items_processed += timed_out
+
             # Get all jobs awaiting payment
             awaiting_jobs = await self.get_awaiting_payment_jobs(conn)
-            
+
             if not awaiting_jobs:
                 logger.info("No jobs awaiting payment found")
                 await conn.close()
                 return
-            
+
             logger.info(f"Found {len(awaiting_jobs)} jobs awaiting payment")
-            
-            # Process each job individually for better scalability
+
+            # Fetch all recent payments once (with pagination, stops at payments older than 12h)
+            recent_payments = await self.fetch_recent_payments()
+
+            if not recent_payments:
+                logger.info("No recent payments found in payment service")
+                await conn.close()
+                return
+
+            # Build set of job blockchain IDs for quick lookup
+            jobs_by_blockchain_id: Dict[str, Dict[str, Any]] = {}
             for job in awaiting_jobs:
-                agent_id = job['agent_identifier']
-                if not agent_id:
-                    logger.warning(f"Job {job['job_id']} has no agent identifier")
-                    continue
-                
-                job_blockchain_id = self.extract_blockchain_identifier(job['payment_data'])
-                if not job_blockchain_id:
+                blockchain_id = self.extract_blockchain_identifier(job['payment_data'])
+                if blockchain_id:
+                    jobs_by_blockchain_id[blockchain_id] = job
+                else:
                     logger.warning(f"Job {job['job_id']} has no blockchain identifier")
-                    continue
-                
-                logger.info(f"Checking payment for job {job['job_id']} with agent: {agent_id[:20]}...")
-                
-                # Create individual payment instance for this job
-                payment_status_response = await self.get_payment_status_for_job(agent_id, job)
-                
-                if not payment_status_response or payment_status_response.get('status') != 'success':
-                    logger.warning(f"Failed to get payment status for job {job['job_id']}")
-                    continue
-                
-                # Extract payments data
-                payments_data = payment_status_response.get('data', {})
-                all_payments = payments_data.get('Payments', [])
-                
-                if not all_payments:
-                    logger.info(f"No payments found for job {job['job_id']}")
-                    continue
-                
-                logger.info(f"Found {len(all_payments)} payments for job {job['job_id']}")
-                
-                # Find matching payment by blockchain identifier
-                matching_payment = None
-                for payment in all_payments:
-                    if payment.get('blockchainIdentifier') == job_blockchain_id:
-                        matching_payment = payment
-                        break
-                
+
+            logger.info(f"Checking {len(jobs_by_blockchain_id)} jobs against {len(recent_payments)} recent payments")
+
+            # Match jobs to payments
+            for blockchain_id, job in jobs_by_blockchain_id.items():
+                matching_payment = recent_payments.get(blockchain_id)
+
                 if not matching_payment:
-                    logger.info(f"No matching payment found for job {job['job_id']} with blockchain ID {job_blockchain_id[:20]}...")
+                    # Payment not found in recent payments - either not paid yet or too old
                     continue
-                
+
                 # Check if payment is locked (funds are available)
                 on_chain_state = matching_payment.get('onChainState')
-                
+                logger.info(f"Job {job['job_id']} payment state: {on_chain_state}")
+
                 if on_chain_state == 'FundsLocked':
                     logger.info(f"Payment for job {job['job_id']} is now locked. Updating status to 'running'")
-                    
+
                     success = await self.update_job_status(
                         conn,
                         str(job['job_id']),
@@ -243,10 +319,10 @@ class PaymentChecker:
                         waiting_for_start=True,
                         message=RUNNING_MESSAGE
                     )
-                    
+
                     if success:
                         logger.info(f"Successfully updated job {job['job_id']} to 'running' status")
-                        items_processed += 1  # Count successful updates
+                        items_processed += 1
                     else:
                         logger.error(f"Failed to update job {job['job_id']} status")
                 else:
