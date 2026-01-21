@@ -643,6 +643,15 @@ async def check_job_status(
             seed = f"{job_id_value}:{status_marker}:{updated_marker}"
             return str(uuid.uuid5(namespace, seed))
 
+        def format_display_name(name: str) -> str:
+            """Format a field name into a human-readable display name."""
+            # Handle snake_case
+            result = name.replace('_', ' ')
+            # Handle camelCase - insert space before uppercase letters
+            result = re.sub(r'([a-z])([A-Z])', r'\1 \2', result)
+            # Title case each word
+            return result.title()
+
         def build_input_schema_from_result(job_record: Dict[str, Any]) -> Optional[InputSchemaResponse]:
             """Extract lock-driven input fields when job awaits human input."""
             if job_record.get("status") != "awaiting_input":
@@ -661,11 +670,17 @@ async def check_job_status(
                 return None
 
             type_map = {
-                "text": "string",
+                "text": "text",
                 "textarea": "textarea",
                 "boolean": "boolean",
                 "checkbox": "boolean",
                 "number": "number",
+                "password": "password",
+                "date": "date",
+                "time": "time",
+                "datetime-local": "datetime",
+                "select": "option",
+                "file": "file",
             }
 
             collected_fields: List[InputField] = []
@@ -712,11 +727,18 @@ async def check_job_status(
                     if isinstance(raw_validations, list):
                         validations = raw_validations
 
+                    # Ensure name is never None - use label, fall back to formatted field_id
+                    display_name = element.get("label") or element.get("name")
+                    if not display_name:
+                        display_name = format_display_name(str(field_id))
+                    elif display_name == field_id:
+                        display_name = format_display_name(display_name)
+
                     collected_fields.append(
                         InputField(
                             id=str(field_id),
                             type=field_type,
-                            name=element.get("label") or element.get("name"),
+                            name=display_name,
                             data=data or None,
                             validations=validations
                         )
