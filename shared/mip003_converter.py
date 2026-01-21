@@ -93,9 +93,20 @@ class MIP003Converter:
         if element_type == 'text':
             mip003_type = self._detect_text_subtype(element, element_name)
 
-        # Ensure name is never null - use label, fall back to element_name, then to id
-        display_name = element.get('label') or element_name or 'Input'
-        # Convert snake_case/camelCase to Title Case for display
+        # Ensure name is never null - use label, option (for booleans), or element_name
+        display_name = element.get('label')
+
+        # For boolean/checkbox fields, use the option text as the display name if no label
+        if not display_name and element_type in ('boolean', 'checkbox'):
+            option_text = element.get('option')
+            if isinstance(option_text, str) and option_text.strip():
+                display_name = option_text.strip()
+
+        # Fall back to element_name
+        if not display_name:
+            display_name = element_name or 'Input'
+
+        # Convert snake_case/camelCase to Title Case for display (only for field names)
         if display_name == element_name:
             display_name = self._format_display_name(element_name)
 
@@ -194,10 +205,7 @@ class MIP003Converter:
             if values:
                 data['values'] = values
         
-        # Handle checkbox options
-        elif element.get('type') == 'checkbox' and element.get('option'):
-            # For checkboxes, the option text can serve as placeholder
-            data['placeholder'] = element.get('option', '')
+        # Boolean/checkbox options are handled via the name field, not data
 
         # Handle file inputs
         elif element.get('type') == 'file':

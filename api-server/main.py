@@ -116,7 +116,16 @@ def _clean_schema_text(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
     cleaned = HTML_TAG_RE.sub("", value)
-    cleaned = cleaned.replace("\r", "").strip()
+    cleaned = cleaned.replace("\r", "")
+    # Normalize whitespace: collapse multiple spaces/tabs, preserve single newlines
+    lines = cleaned.split("\n")
+    normalized_lines = []
+    for line in lines:
+        # Strip leading/trailing whitespace from each line
+        stripped = line.strip()
+        if stripped:
+            normalized_lines.append(stripped)
+    cleaned = "\n".join(normalized_lines)
     if not cleaned:
         return None
     return unescape(cleaned)
@@ -137,6 +146,10 @@ def _extract_pending_input_context(pending_request: Optional[Dict[str, Any]]) ->
     if isinstance(schema_raw, list):
         for element in schema_raw:
             if not isinstance(element, dict):
+                continue
+            # Skip non-content elements (buttons, separators)
+            element_type = element.get("type", "").lower()
+            if element_type in {"submit", "cancel", "hr", "html"}:
                 continue
             text_value = element.get("text")
             cleaned_text = _clean_schema_text(text_value)
@@ -702,7 +715,7 @@ async def check_job_status(
                         continue
 
                     normalized_type = element_type.lower()
-                    if normalized_type in {"submit", "cancel", "markdown"}:
+                    if normalized_type in {"submit", "cancel", "markdown", "hr", "html"}:
                         continue
 
                     field_id = element.get("name") or element.get("id")
@@ -727,8 +740,14 @@ async def check_job_status(
                     if isinstance(raw_validations, list):
                         validations = raw_validations
 
-                    # Ensure name is never None - use label, fall back to formatted field_id
-                    display_name = element.get("label") or element.get("name")
+                    # Ensure name is never None - use label, option (for booleans), or formatted field_id
+                    display_name = element.get("label")
+                    if not display_name and normalized_type in ("boolean", "checkbox"):
+                        option_text = element.get("option")
+                        if isinstance(option_text, str) and option_text.strip():
+                            display_name = option_text.strip()
+                    if not display_name:
+                        display_name = element.get("name")
                     if not display_name:
                         display_name = format_display_name(str(field_id))
                     elif display_name == field_id:
