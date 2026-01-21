@@ -27,13 +27,13 @@ class MIP003Converter:
     def __init__(self):
         """Initialize the converter with mapping configurations."""
         self.type_mapping = {
-            'text': 'string',
-            'password': 'string',
+            'text': 'text',
+            'password': 'password',
             'number': 'number',
             'textarea': 'textarea',
-            'date': 'string',
-            'time': 'string',
-            'datetime-local': 'string',
+            'date': 'date',
+            'time': 'time',
+            'datetime-local': 'datetime',
             'boolean': 'boolean',
             'select': 'option',
             'checkbox': 'boolean',
@@ -72,35 +72,95 @@ class MIP003Converter:
     def _convert_element(self, element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Convert a single Kodosumi element to MIP003 format.
-        
+
         Args:
             element: Single Kodosumi input element
-            
+
         Returns:
             MIP003 compliant element or None if not convertible
         """
         element_type = element.get('type', '')
         element_name = element.get('name', '')
-        
+
         # Skip elements without name or unsupported types
         if not element_name or element_type not in self.type_mapping:
             return None
-        
+
+        # Get the base MIP003 type from mapping
+        mip003_type = self.type_mapping[element_type]
+
+        # Detect more specific types for text inputs
+        if element_type == 'text':
+            mip003_type = self._detect_text_subtype(element, element_name)
+
+        # Ensure name is never null - use label, fall back to element_name, then to id
+        display_name = element.get('label') or element_name or 'Input'
+        # Convert snake_case/camelCase to Title Case for display
+        if display_name == element_name:
+            display_name = self._format_display_name(element_name)
+
         # Base MIP003 structure - don't include validations by default
         mip003_element = {
             'id': element_name,
-            'type': self.type_mapping[element_type],
-            'name': element.get('label', element_name),
+            'type': mip003_type,
+            'name': display_name,
             'data': {}
         }
-        
+
         # Add data fields
         self._add_data_fields(element, mip003_element)
-        
+
         # Add validations - this will only add the field if there are validations
         self._add_validations(element, mip003_element)
-        
+
         return mip003_element
+
+    def _detect_text_subtype(self, element: Dict[str, Any], element_name: str) -> str:
+        """
+        Detect if a text input should be a more specific MIP003 type.
+
+        Args:
+            element: Original Kodosumi element
+            element_name: The element's name/id
+
+        Returns:
+            The appropriate MIP003 type (url, email, or text)
+        """
+        name_lower = element_name.lower()
+        pattern = (element.get('pattern') or '').lower()
+        placeholder = (element.get('placeholder') or '').lower()
+        label = (element.get('label') or '').lower()
+
+        # Check for URL type
+        if ('url' in name_lower or 'url' in pattern or
+            'url' in placeholder or 'url' in label or
+            'http' in placeholder or 'https' in placeholder):
+            return 'url'
+
+        # Check for email type
+        if ('email' in name_lower or 'email' in pattern or
+            'email' in placeholder or 'email' in label or
+            '@' in pattern):
+            return 'email'
+
+        return 'text'
+
+    def _format_display_name(self, name: str) -> str:
+        """
+        Format a field name into a human-readable display name.
+
+        Args:
+            name: The field name (e.g., 'input_url', 'skipHitl')
+
+        Returns:
+            A formatted display name (e.g., 'Input Url', 'Skip Hitl')
+        """
+        # Handle snake_case
+        result = name.replace('_', ' ')
+        # Handle camelCase - insert space before uppercase letters
+        result = re.sub(r'([a-z])([A-Z])', r'\1 \2', result)
+        # Title case each word
+        return result.title()
     
     def _add_data_fields(self, element: Dict[str, Any], mip003_element: Dict[str, Any]):
         """
