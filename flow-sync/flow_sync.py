@@ -29,7 +29,7 @@ from mip003_converter import convert_kodosumi_to_mip003
 load_dotenv()
 
 # Configuration
-KODOSUMI_SERVER_URL = os.getenv('KODOSUMI_SERVER_URL')
+KODOSUMI_SERVER_URL = (os.getenv('KODOSUMI_SERVER_URL') or '').rstrip('/') or None
 MIP003_API_BASE_URL = os.getenv('MIP003_API_BASE_URL')
 
 # Pre-compute the public host/port we should publish in flow URLs
@@ -234,15 +234,18 @@ def upsert_flow(flow_data: Dict, input_schema: Dict) -> bool:
                 print(f"   ⚠ MIP003 conversion failed: {str(e)}")
                 mip003_schema = None
         
-        # Prepare the upsert query - prefer uid to avoid summary-based conflicts
+        # Prepare the upsert query - use summary as conflict target since Kodosumi
+        # may change flow UIDs on infrastructure updates (e.g. port changes).
+        # The jobs FK on flows(uid) has ON UPDATE CASCADE so UID changes propagate.
         upsert_query = """
             INSERT INTO flows (
-                uid, author, deprecated, description, method, 
+                uid, author, deprecated, description, method,
                 organization, source, summary, tags, url, input_schema, mip003_schema
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
-            ON CONFLICT ON CONSTRAINT flows_uid_key DO UPDATE SET
+            ON CONFLICT ON CONSTRAINT flows_summary_unique DO UPDATE SET
+                uid = EXCLUDED.uid,
                 author = EXCLUDED.author,
                 deprecated = EXCLUDED.deprecated,
                 description = EXCLUDED.description,

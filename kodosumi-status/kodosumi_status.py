@@ -66,7 +66,7 @@ class KodosumiStatusChecker:
         self.database_url = self._build_database_url()
         
         # Kodosumi configuration
-        self.kodosumi_server_url = os.getenv('KODOSUMI_SERVER_URL', 'http://localhost:3370')
+        self.kodosumi_server_url = os.getenv('KODOSUMI_SERVER_URL', 'http://localhost:3370').rstrip('/')
         
     def _build_database_url(self) -> str:
         """Build PostgreSQL connection URL from environment variables."""

@@ -13,7 +13,7 @@ from cron_logger import CronExecutionLogger
 load_dotenv()
 
 # Configuration
-KODOSUMI_SERVER_URL = os.getenv('KODOSUMI_SERVER_URL')
+KODOSUMI_SERVER_URL = (os.getenv('KODOSUMI_SERVER_URL') or '').rstrip('/') or None
 KODOSUMI_USERNAME = os.getenv('KODOSUMI_USERNAME')
 KODOSUMI_PASSWORD = os.getenv('KODOSUMI_PASSWORD')
 

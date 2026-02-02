@@ -64,7 +64,7 @@ class KodosumiStarter:
         self.database_url = self._build_database_url()
         
         # Kodosumi configuration
-        self.kodosumi_server_url = os.getenv('KODOSUMI_SERVER_URL', 'http://localhost:3370')
+        self.kodosumi_server_url = os.getenv('KODOSUMI_SERVER_URL', 'http://localhost:3370').rstrip('/')
         self.kodosumi_username = os.getenv('KODOSUMI_USERNAME')
         self.kodosumi_password = os.getenv('KODOSUMI_PASSWORD')
         
